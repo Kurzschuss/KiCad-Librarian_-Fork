@@ -27,6 +27,7 @@
 #include "libmngr_paths.h"
 #include "libmngr_dlgreport.h"
 #include "libmngr_dlgtemplate.h"
+#include "kicadfootprintpreview.h"
 #include "kicadsymbolpreview.h"
 #include "pdfreport.h"
 #include "remotelink.h"
@@ -238,6 +239,7 @@ AppFrame(parent)
     PinData[0] = PinData[1] = NULL;
     PinDataCount[0] = PinDataCount[1] = 0;
     UseSymbolPreviewData[0] = UseSymbolPreviewData[1] = false;
+    UseFootprintPreviewData[0] = UseFootprintPreviewData[1] = false;
     SelectedPartLeft = SelectedPartRight = -1;
     PartEdited = FieldEdited = false;
 
@@ -3051,6 +3053,8 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
             continue;
         if (PartData[fp].Count() == 0)
             continue;
+        const wxArrayString& footprintData = UseFootprintPreviewData[fp]
+            ? FootprintPreviewData[fp] : PartData[fp];
         if (fp == 0) {
             clrBody.Set(192, 192, 96, transp[fp]);
             clrPad.Set(160, 0, 0, transp[fp]);
@@ -3076,8 +3080,8 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
         gc->SetBrush(*wxTRANSPARENT_BRUSH);
         bool unit_mm = Footprint[fp].Type >= VER_MM;
         double module_angle = 0;    /* all angles should be corrected with the footprint angle */
-        for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-            wxString line = PartData[fp][idx];
+        for (int idx = 0; idx < (int)footprintData.Count(); idx++) {
+            wxString line = footprintData[idx];
             wxString token = GetToken(&line);
             if (token.CmpNoCase(wxT("Po")) == 0) {
                 GetToken(&line);    /* ignore X position */
@@ -3171,7 +3175,7 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
                 wxASSERT(pt != NULL);
                 for (long p = 0; p < count; p++) {
                     idx++;
-                    line = PartData[fp][idx];
+                    line = footprintData[idx];
                     token = GetToken(&line);
                     wxASSERT(token.CmpNoCase(wxT("Dl")) == 0);
                     double x = GetTokenDim(&line, unit_mm);
@@ -3439,13 +3443,16 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
         bool padsmd = false, padbottomside = false;
         wxPoint2DDouble pastepoints[5];
         wxString padpin, padshape;
-        for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-            wxString line = PartData[fp][idx];
+        for (int idx = 0; idx < (int)footprintData.Count(); idx++) {
+            wxString line = footprintData[idx];
             if (line[0] == wxT('$')) {
                 if (line.CmpNoCase(wxT("$PAD")) == 0) {
                     inpad = true;
                     drillwidth = drillheight = 0;
                     pasteratio = 0.0;
+                    paddeltax = paddeltay = 0.0;
+                    padrratio = 0.5;
+                    padsmd = padbottomside = false;
                 } else if (line.CmpNoCase(wxT("$EndPAD")) == 0) {
                     wxBrush *brushPad = padbottomside ? &brushRev : &brushStd;
                     wxPen *penPad = padbottomside ? &penRev : &penStd;
@@ -4720,7 +4727,12 @@ bool libmngrFrame::MatchFootprint(const wxString& libname, const wxString& symna
         if (LoadFootprint(libname, symname, wxEmptyString, false, &footprint, &version)) {
             unqlite_close(pDb); /* close the database, for caching the data */
             FootprintInfo fp(version);
-            TranslatePadInfo(&footprint, &fp);
+            if (version == VER_S_EXPR) {
+                wxArrayString preview;
+                ConvertModernFootprintToLegacyPreview(footprint, &preview, &fp);
+            } else {
+                TranslatePadInfo(&footprint, &fp);
+            }
             CacheMetadata(libname, symname, true, footprint, fp);
             /* re-open the database */
             rc = unqlite_open(&pDb, path.c_str(), UNQLITE_OPEN_CREATE);
@@ -4950,6 +4962,8 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
     PartData[fp].Clear();
     SymbolPreviewData[fp].Clear();
     UseSymbolPreviewData[fp] = false;
+    FootprintPreviewData[fp].Clear();
+    UseFootprintPreviewData[fp] = false;
 
     /* get the name of the symbol and the library it is in */
     wxString symbol = list->GetItemText(index);
@@ -5048,9 +5062,9 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
         PinData[fp] = 0;
         PinDataCount[fp] = 0;
     }
-    const wxArrayString& displayData = SymbolMode && UseSymbolPreviewData[fp]
-        ? SymbolPreviewData[fp] : PartData[fp];
     if (SymbolMode) {
+        const wxArrayString& displayData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
         /* extract pin names and order */
         GetPinNames(displayData, NULL, &PinDataCount[fp]);
         if (PinDataCount[fp] > 0) {
@@ -5061,10 +5075,25 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
     } else {
         /* get the pin pitch and pad size, plus the body size */
         Footprint[fp].Type = version;
-        TranslatePadInfo(&PartData[fp], &Footprint[fp]);
+        if (version == VER_S_EXPR) {
+            wxString previewError;
+            if (ConvertModernFootprintToLegacyPreview(PartData[fp],
+                    &FootprintPreviewData[fp], &Footprint[fp], &previewError))
+            {
+                UseFootprintPreviewData[fp] = true;
+            } else {
+                m_statusBar->SetStatusText(wxT("Preview unavailable: ") + previewError);
+            }
+        } else {
+            TranslatePadInfo(&PartData[fp], &Footprint[fp]);
+        }
         /* optionally cache the metadata (pitch, courtyard, descriptions) */
         CacheMetadata(filename, symbol, false, PartData[fp], Footprint[fp]);
     }
+    const wxArrayString& displayData = SymbolMode && UseSymbolPreviewData[fp]
+        ? SymbolPreviewData[fp]
+        : (!SymbolMode && UseFootprintPreviewData[fp]
+            ? FootprintPreviewData[fp] : PartData[fp]);
     GetBodySize(displayData, &BodySize[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
     GetTextLabelSize(displayData, &LabelData[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
     if (SymbolMode) {

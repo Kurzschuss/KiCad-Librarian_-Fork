@@ -61,6 +61,7 @@ SET(LIBMAN_SRCS librarymanager.cpp          librarymanager.h
                 libmngr_gui_base.cpp        libmngr_gui_base.h
                 cxffont.cpp                 cxffont.h
                 kicadsexpr.cpp              kicadsexpr.h
+                kicadfootprintpreview.cpp   kicadfootprintpreview.h
                 kicadsymbolpreview.cpp       kicadsymbolpreview.h
                 libraryfunctions.cpp        libraryfunctions.h
                 pdfreport.cpp               pdfreport.h
@@ -116,10 +117,21 @@ IF(BUILD_TESTING)
     TARGET_INCLUDE_DIRECTORIES(symbol_directory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     TARGET_LINK_LIBRARIES(symbol_directory_tests ${wxWidgets_LIBRARIES})
     ADD_TEST(NAME symbol_directory_tests COMMAND symbol_directory_tests)
+
+    ADD_EXECUTABLE(footprint_preview_tests
+                   ../tests/footprint_preview_tests.cpp
+                   kicadsexpr.cpp
+                   kicadfootprintpreview.cpp
+                   libraryfunctions.cpp
+                   rpn.cpp)
+    TARGET_INCLUDE_DIRECTORIES(footprint_preview_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    TARGET_LINK_LIBRARIES(footprint_preview_tests ${wxWidgets_LIBRARIES})
+    ADD_TEST(NAME footprint_preview_tests COMMAND footprint_preview_tests)
     IF(MINGW)
         GET_FILENAME_COMPONENT(MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         SET_TESTS_PROPERTIES(kicadsexpr_tests PROPERTIES ENVIRONMENT "PATH=${MINGW_RUNTIME_DIR}")
         SET_TESTS_PROPERTIES(symbol_directory_tests PROPERTIES ENVIRONMENT "PATH=${MINGW_RUNTIME_DIR}")
+        SET_TESTS_PROPERTIES(footprint_preview_tests PROPERTIES ENVIRONMENT "PATH=${MINGW_RUNTIME_DIR}")
     ENDIF(MINGW)
 ENDIF(BUILD_TESTING)
 

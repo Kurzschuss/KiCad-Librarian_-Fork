@@ -222,6 +222,8 @@ private:
     wxArrayString PartData[2];  /* max. 2 footprints or symbols may be loaded at any time */
     wxArrayString SymbolPreviewData[2]; /* temporary legacy rendering data for modern symbols */
     bool UseSymbolPreviewData[2];
+    wxArrayString FootprintPreviewData[2]; /* temporary legacy rendering data for modern footprints */
+    bool UseFootprintPreviewData[2];
     FootprintInfo Footprint[2]; /* dimensions, pad information and others (footprints) */
     BodyInfo BodySize[2];       /* body size (footprints & symbols) */
     LabelInfo LabelData[2];     /* reference and value labels (footprints & symbols) */

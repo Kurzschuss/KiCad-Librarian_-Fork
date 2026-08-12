@@ -342,7 +342,12 @@ bool StoreSymbolInfo(const wxString& name, const wxString& description, const wx
 					 const wxString& aliases, const wxString& footprints, const wxString& imagefile);
 
 bool ExistSymbol(const wxString& filename, const wxString& name, const wxString& author = wxEmptyString);
+bool IsModernSymbolLibraryPath(const wxString& filename);
+bool GetSymbolNames(const wxString& filename, wxArrayString* names);
+bool CopySymbolDependencies(const wxString& source, const wxString& target, const wxString& name);
+bool SymbolHasDependents(const wxString& filename, const wxString& name);
 bool InsertSymbol(const wxString& filename, const wxString& name, const wxArrayString& symbol);
+bool SaveSymbol(const wxString& filename, const wxString& name, const wxArrayString& symbol);
 bool RemoveSymbol(const wxString& filename, const wxString& name);
 bool RenameSymbol(wxArrayString* symbol, const wxString& oldname, const wxString& newname);
 bool RenameSymbol(const wxString& filename, const wxString& oldname, const wxString& newname);

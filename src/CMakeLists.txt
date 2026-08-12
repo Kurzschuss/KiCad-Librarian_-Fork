@@ -3,7 +3,7 @@
 # When compiling with MingW, set "-Wl,--subsystem,windows" in the
 # CMAKE_EXE_LINKER_FLAGS field (do not add the quotes).
 
-CMAKE_MINIMUM_REQUIRED(VERSION 2.6)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 
 PROJECT(kicadlibrarian)
 
@@ -11,9 +11,9 @@ SET(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 SET(KiCadLibrarian_USE_CURL "TRUE" CACHE BOOL "Whether to include the remote repository functions, which require CURL")
 SET(KiCadLibrarian_USE_CX3D "TRUE" CACHE BOOL "Whether to include the 3D/VRML support, based on CyberX3D")
 
-FIND_PACKAGE(wxWidgets COMPONENTS base core adv aui gl QUIET)
+FIND_PACKAGE(wxWidgets 3.0 COMPONENTS base core adv aui gl QUIET)
 IF(NOT wxWidgets_FOUND)
-    FIND_PACKAGE(wxWidgets COMPONENTS mono REQUIRED)
+    FIND_PACKAGE(wxWidgets 3.0 COMPONENTS mono REQUIRED)
 ENDIF(NOT wxWidgets_FOUND)
 INCLUDE("${wxWidgets_USE_FILE}")
 
@@ -60,6 +60,7 @@ SET(LIBMAN_SRCS librarymanager.cpp          librarymanager.h
                 libmngr_paths.cpp           libmngr_paths.h
                 libmngr_gui_base.cpp        libmngr_gui_base.h
                 cxffont.cpp                 cxffont.h
+                kicadsexpr.cpp              kicadsexpr.h
                 libraryfunctions.cpp        libraryfunctions.h
                 pdfreport.cpp               pdfreport.h
                 rpn.cpp                     rpn.h
@@ -94,6 +95,16 @@ ENDIF(KiCadLibrarian_USE_CX3D)
 
 ADD_EXECUTABLE(kicadlibrarian ${LIBMAN_SRCS})
 TARGET_LINK_LIBRARIES(kicadlibrarian ${LIBMAN_LIBS})
+
+INCLUDE(CTest)
+IF(BUILD_TESTING)
+    ADD_EXECUTABLE(kicadsexpr_tests
+                   ../tests/kicadsexpr_tests.cpp
+                   kicadsexpr.cpp)
+    TARGET_INCLUDE_DIRECTORIES(kicadsexpr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    TARGET_LINK_LIBRARIES(kicadsexpr_tests ${wxWidgets_LIBRARIES})
+    ADD_TEST(NAME kicadsexpr_tests COMMAND kicadsexpr_tests)
+ENDIF(BUILD_TESTING)
 
 ##### Installation instructions
 

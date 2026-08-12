@@ -9,6 +9,7 @@
 #ifndef KICADSEXPR_H
 #define KICADSEXPR_H
 
+#include <wx/arrstr.h>
 #include <wx/string.h>
 #include <vector>
 

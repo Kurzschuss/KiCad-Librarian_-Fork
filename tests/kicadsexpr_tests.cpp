@@ -1,5 +1,8 @@
 #include "kicadsexpr.h"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <vector>
 
@@ -20,7 +23,7 @@ static int FindChild(const std::vector<KiCadSexprNode>& nodes, int parent,
 int main()
 {
     wxString symbolLibrary =
-        wxT("(kicad_symbol_lib\n")
+        wxString(wxT("(kicad_symbol_lib\n"))
         + wxT("  (version 20251024)\n")
         + wxT("  (future_header (opaque \"keep me\"))\n")
         + wxT("  (symbol \"Parent\" (future_symbol_field 42))\n")
@@ -49,7 +52,7 @@ int main()
     assert(symbolLibrary.Find(wxT("future_property yes")) >= 0);
 
     wxString footprint =
-        wxT("(footprint \"Modern\"\n")
+        wxString(wxT("(footprint \"Modern\"\n"))
         + wxT("  (version 20260206)\n")
         + wxT("  (unknown_kicad10_field (nested true))\n")
         + wxT("  (model \"${KICAD10_3DMODEL_DIR}/Package.3dshapes/Body.step\")\n")

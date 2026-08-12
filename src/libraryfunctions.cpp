@@ -2988,7 +2988,7 @@ bool FootprintFromTemplate(wxArrayString* module, const wxArrayString& templat,
             rpn.Set("$PSH");
             if (rpn.Parse() == RPN_OK) {
                 wxString shape = rpn.Value().Text();
-                rpn.SetVariable(RPNvariable("PSH", TranslatePadShape(shape, pad, legacy)));
+                rpn.SetVariable(RPNvariable("PSH", TranslatePadShape(shape, pad, legacy).mb_str()));
                 double rratio = -1;
                 if (shape.Cmp(wxT("roundrect")) == 0) {
                     rpn.Set("$PRR");

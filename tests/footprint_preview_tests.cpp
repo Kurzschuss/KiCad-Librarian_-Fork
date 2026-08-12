@@ -95,6 +95,40 @@ int main()
     assert(GetBodySize(preview, &body, false, true));
     assert(body.BodyWidth >= 8.0 && body.BodyLength >= 10.0);
 
+    wxString textCompatibility =
+        wxString(wxT("(footprint \"TextCompatibility\"\n"))
+        + wxT("  (fp_text reference \"REF**\" (at 1 2 0) (layer \"F.SilkS\") hide\n")
+        + wxT("    (effects (font (size 1 1) (thickness 0.15))))\n")
+        + wxT("  (fp_text value \"VALUE\" (at 3 4 0) (layer \"F.Fab\")\n")
+        + wxT("    (effects (font (size 1 1) (thickness 0.15))))\n")
+        + wxT("  (fp_text user \"USER\" (at 5 6 0) (layer \"F.SilkS\")\n")
+        + wxT("    (effects (font (size 1 1) (thickness 0.15))))\n")
+        + wxT(")\n");
+    assert(ConvertModernFootprintTextToLegacyPreview(textCompatibility,
+                                                     &preview, &info, &error));
+    assert(CountLines(preview, wxT("T0 ")) == 1);
+    assert(CountLines(preview, wxT("T1 ")) == 1);
+    assert(CountLines(preview, wxT("T2 ")) == 1);
+    bool referenceHidden = false;
+    for (size_t idx = 0; idx < preview.Count(); idx++) {
+        if (preview[idx].StartsWith(wxT("T0 "))
+            && preview[idx].Find(wxT(" N I 21 ")) != wxNOT_FOUND)
+        {
+            referenceHidden = true;
+        }
+    }
+    assert(referenceHidden);
+
+    preview.Add(wxT("stale preview"));
+    info.PadCount = 99;
+    error = wxT("stale error");
+    assert(!ConvertModernFootprintTextToLegacyPreview(wxT("(footprint"),
+                                                      &preview, &info, &error));
+    assert(preview.Count() == 0);
+    assert(info.PadCount == 0);
+    assert(info.Type == VER_S_EXPR);
+    assert(!error.IsEmpty());
+
     wxString dipLibrary = wxT("C:\\Program Files\\KiCad\\10.99\\share\\kicad\\footprints\\Package_DIP.pretty");
     wxString dipFile = dipLibrary + wxT("\\DIP-8_W7.62mm.kicad_mod");
     if (wxFileExists(dipFile)) {

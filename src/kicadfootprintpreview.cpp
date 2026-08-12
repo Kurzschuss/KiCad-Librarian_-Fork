@@ -239,8 +239,24 @@ static void ConvertGraphic(const FootprintDocument& document, int primitive,
     }
 }
 
+static bool HasAtom(const KiCadSexprNode& node, const wxString& value)
+{
+    for (size_t idx = 0; idx < node.atoms.size(); idx++) {
+        if (node.atoms[idx].value.CmpNoCase(value) == 0)
+            return true;
+    }
+    return false;
+}
+
 static bool Hidden(const FootprintDocument& document, int owner)
 {
+    if (HasAtom(document.nodes[owner], wxT("hide")))
+        return true;
+
+    int effects = FindChild(document, owner, wxT("effects"));
+    if (effects >= 0 && HasAtom(document.nodes[effects], wxT("hide")))
+        return true;
+
     int hide = FindChild(document, owner, wxT("hide"));
     return hide >= 0 && (document.nodes[hide].atoms.empty()
         || document.nodes[hide].atoms[0].value.CmpNoCase(wxT("yes")) == 0);
@@ -552,7 +568,14 @@ static bool BuildPreview(const FootprintDocument& document, wxArrayString* previ
         {
             ConvertGraphic(document, (int)idx, preview);
         } else if (node.head == wxT("fp_text") && node.atoms.size() >= 2) {
-            ConvertText(document, (int)idx, userText++, node.atoms[1].value, preview);
+            int field;
+            if (node.atoms[0].value == wxT("reference"))
+                field = 0;
+            else if (node.atoms[0].value == wxT("value"))
+                field = 1;
+            else
+                field = userText++;
+            ConvertText(document, (int)idx, field, node.atoms[1].value, preview);
         } else if (node.head == wxT("property") && node.atoms.size() >= 2) {
             if (node.atoms[0].value == wxT("Reference"))
                 ConvertText(document, (int)idx, 0, node.atoms[1].value, preview);
@@ -580,10 +603,21 @@ bool ConvertModernFootprintTextToLegacyPreview(const wxString& footprintText,
 {
     if (!preview || !info)
         return Fail(error, wxT("No footprint preview output was supplied."));
+
+    preview->Clear();
+    info->Clear(VER_S_EXPR);
+    if (error)
+        error->Clear();
+
     FootprintDocument document;
     if (!ParseDocument(footprintText, &document))
         return Fail(error, wxT("Invalid modern footprint."));
-    return BuildPreview(document, preview, info, error);
+    if (!BuildPreview(document, preview, info, error)) {
+        preview->Clear();
+        info->Clear(VER_S_EXPR);
+        return false;
+    }
+    return true;
 }
 
 bool ConvertModernFootprintToLegacyPreview(const wxArrayString& footprint,

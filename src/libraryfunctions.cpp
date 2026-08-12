@@ -5658,7 +5658,9 @@ static wxString ModernSymbolFile(const wxString& library, const wxString& name)
 {
     if (!IsSymbolDirectory(library))
         return library;
-    return wxFileName(library, name + wxT(".kicad_sym")).GetFullPath();
+    wxFileName file = wxFileName::DirName(library);
+    file.SetFullName(name + wxT(".kicad_sym"));
+    return file.GetFullPath();
 }
 
 static int FindModernSymbolNode(const wxString& text, const wxString& name,
@@ -6077,7 +6079,18 @@ bool InsertSymbol(const wxString& filename, const wxString& name, const wxArrayS
                 + wxT("  (generator kicad_librarian)") + newline
                 + wxT("  (generator_version \"1.5\")") + newline
                 + IndentSexprBlock(block, newline) + newline + wxT(")") + newline;
-            return WriteKiCadTextFile(ModernSymbolFile(filename, name), contents);
+            wxString symbolFile = ModernSymbolFile(filename, name);
+            if (!WriteKiCadTextFile(symbolFile, contents))
+                return false;
+
+            wxString written;
+            std::vector<KiCadSexprNode> writtenNodes;
+            int writtenSymbol = -1;
+            if (!LoadModernSymbolText(filename, name, &written, &writtenNodes, &writtenSymbol)) {
+                wxRemoveFile(symbolFile);
+                return false;
+            }
+            return true;
         }
 
         wxString text;
@@ -6388,6 +6401,15 @@ bool RenameSymbol(const wxString& filename, const wxString& oldname, const wxStr
             wxString oldfile = ModernSymbolFile(filename, oldname);
             if (!WriteKiCadTextFile(newfile, text))
                 return false;
+            wxString written;
+            std::vector<KiCadSexprNode> writtenNodes;
+            int writtenSymbol = -1;
+            if (!LoadModernSymbolText(filename, newname, &written,
+                                      &writtenNodes, &writtenSymbol))
+            {
+                wxRemoveFile(newfile);
+                return false;
+            }
             if (!wxRemoveFile(oldfile)) {
                 wxRemoveFile(newfile);
                 return false;

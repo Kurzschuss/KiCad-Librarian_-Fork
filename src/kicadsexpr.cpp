@@ -175,7 +175,7 @@ wxString KiCadLinesToText(const wxArrayString& lines)
 
 bool ReadKiCadTextFile(const wxString& path, wxString* text)
 {
-    if (!text)
+    if (!text || !wxFileExists(path))
         return false;
     wxFFile file(path, wxT("rb"));
     return file.IsOpened() && file.ReadAll(text, wxConvUTF8);
@@ -183,8 +183,22 @@ bool ReadKiCadTextFile(const wxString& path, wxString* text)
 
 bool WriteKiCadTextFile(const wxString& path, const wxString& text)
 {
+    if (!wxFileExists(path)) {
+        wxFFile file(path, wxT("wb"));
+        if (!file.IsOpened())
+            return false;
+        bool written = file.Write(text, wxConvUTF8);
+        bool closed = file.Close();
+        if (!written || !closed) {
+            if (wxFileExists(path))
+                wxRemoveFile(path);
+            return false;
+        }
+        return wxFileExists(path);
+    }
+
     wxTempFile file(path);
     if (!file.IsOpened() || !file.Write(text, wxConvUTF8))
         return false;
-    return file.Commit();
+    return file.Commit() && wxFileExists(path);
 }

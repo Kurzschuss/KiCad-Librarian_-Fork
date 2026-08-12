@@ -106,9 +106,20 @@ IF(BUILD_TESTING)
     TARGET_INCLUDE_DIRECTORIES(kicadsexpr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     TARGET_LINK_LIBRARIES(kicadsexpr_tests ${wxWidgets_LIBRARIES})
     ADD_TEST(NAME kicadsexpr_tests COMMAND kicadsexpr_tests)
+
+    ADD_EXECUTABLE(symbol_directory_tests
+                   ../tests/symbol_directory_tests.cpp
+                   kicadsexpr.cpp
+                   kicadsymbolpreview.cpp
+                   libraryfunctions.cpp
+                   rpn.cpp)
+    TARGET_INCLUDE_DIRECTORIES(symbol_directory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    TARGET_LINK_LIBRARIES(symbol_directory_tests ${wxWidgets_LIBRARIES})
+    ADD_TEST(NAME symbol_directory_tests COMMAND symbol_directory_tests)
     IF(MINGW)
         GET_FILENAME_COMPONENT(MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         SET_TESTS_PROPERTIES(kicadsexpr_tests PROPERTIES ENVIRONMENT "PATH=${MINGW_RUNTIME_DIR}")
+        SET_TESTS_PROPERTIES(symbol_directory_tests PROPERTIES ENVIRONMENT "PATH=${MINGW_RUNTIME_DIR}")
     ENDIF(MINGW)
 ENDIF(BUILD_TESTING)
 

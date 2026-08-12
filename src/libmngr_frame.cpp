@@ -371,11 +371,11 @@ void libmngrFrame::OnNewLibrary(wxCommandEvent& /*event*/)
 {
     wxString filter;
     if (SymbolMode)
-        filter = wxT("KiCad symbol libraries (*.kicad_sym)|*.kicad_sym|")
+        filter = wxString(wxT("KiCad symbol libraries (*.kicad_sym)|*.kicad_sym|"))
                + wxT("Unpacked KiCad symbol libraries (*.kicad_symdir)|*.kicad_symdir|")
                + wxT("Legacy symbol libraries (*.lib)|*.lib");
     else
-        filter = wxT("KiCad footprint libraries (*.pretty)|*.pretty|")
+        filter = wxString(wxT("KiCad footprint libraries (*.pretty)|*.pretty|"))
                + wxT("Legacy (mm) (*.mod)|*.mod|Legacy (mil) (*.mod)|*.mod");
     wxFileDialog* dlg = new wxFileDialog(this, wxT("New library..."),
                                          wxEmptyString, wxEmptyString,
@@ -6669,7 +6669,7 @@ bool libmngrFrame::SetVarsFromFields(RPNexpression *rpn, bool SymbolMode)
             shape = wxT("trapezoid");
         else if (shape.CmpNoCase(wxT("Rounded rectangle")) == 0)
             shape = wxT("roundrect");
-        rpn->SetVariable(RPNvariable("$PSH", shape));
+        rpn->SetVariable(RPNvariable("$PSH", shape.mb_str()));
         field = m_txtPadRadius->GetValue();
         if (field.length() > 0 && field.ToLong(&val))
             rpn->SetVariable(RPNvariable("$PRR", val / 100.0));

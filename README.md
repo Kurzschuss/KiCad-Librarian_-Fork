@@ -1,4 +1,22 @@
 # KiCad-Librarian
+
+## Modern KiCad compatibility
+
+KiCad Librarian supports current KiCad S-expression libraries in addition to
+the legacy formats:
+
+* packed symbol libraries (`.kicad_sym`) and KiCad 10 unpacked symbol
+  libraries (`.kicad_symdir`), including safe handling of `extends` parent
+  symbols during library operations;
+* footprint libraries (`.pretty`) containing modern `(footprint ...)`
+  `.kicad_mod` files;
+* WRL and STEP/STP 3D model paths, including versioned KiCad path variables;
+* automatic discovery of user and installed KiCad libraries on Windows.
+
+Modern-to-modern copy, move, rename, duplicate and save operations retain
+unrecognized S-expression fields so libraries remain forward compatible with
+newer KiCad releases. Legacy symbol and footprint libraries remain supported.
+
 The KiCad Librarian allows you to view footprints and schematic symbols in KiCad 
 libraries, and move or copy footprints & symbols from one library to another.
 It allows you to scan all libraries in a list, so that you can check for duplicates

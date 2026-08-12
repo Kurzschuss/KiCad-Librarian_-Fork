@@ -13,3 +13,7 @@ CMakeCache.txt
 CMakeFiles
 Makefile
 kicadlibrarian.desktop
+
+# local build artifacts
+/build-ucrt64/
+/build-error.txt

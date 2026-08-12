@@ -27,6 +27,8 @@
 #include "libmngr_paths.h"
 #include "libmngr_dlgreport.h"
 #include "libmngr_dlgtemplate.h"
+#include "kicadfootprintpreview.h"
+#include "kicadsymbolpreview.h"
 #include "pdfreport.h"
 #include "remotelink.h"
 #include "rpn.h"
@@ -142,6 +144,10 @@ AppFrame(parent)
     Connect(IDM_PASTEGENERAL, wxEVT_COMMAND_MENU_SELECTED, wxCommandEventHandler(libmngrFrame::OnPasteGeneral));
     Connect(IDC_EXPORT, wxEVT_COMMAND_MENU_SELECTED, wxCommandEventHandler(libmngrFrame::OnExportGeneral));
 
+    /* Populate a fresh configuration from Windows Documents, KiCad path
+       variables and standard installer locations. */
+    EnsureDefaultKiCadLibraryPaths();
+
     /* restore application size */
     wxFileConfig *config = new wxFileConfig(APP_NAME, VENDOR_NAME, theApp->GetINIPath());
     long w = 0, h = 0;
@@ -232,6 +238,8 @@ AppFrame(parent)
 
     PinData[0] = PinData[1] = NULL;
     PinDataCount[0] = PinDataCount[1] = 0;
+    UseSymbolPreviewData[0] = UseSymbolPreviewData[1] = false;
+    UseFootprintPreviewData[0] = UseFootprintPreviewData[1] = false;
     SelectedPartLeft = SelectedPartRight = -1;
     PartEdited = FieldEdited = false;
 
@@ -367,28 +375,38 @@ void libmngrFrame::OnNewLibrary(wxCommandEvent& /*event*/)
 {
     wxString filter;
     if (SymbolMode)
-        filter = wxT("Symbol libraries (*.lib)|*.lib");
+        filter = wxString(wxT("KiCad symbol libraries (*.kicad_sym)|*.kicad_sym|"))
+               + wxT("Unpacked KiCad symbol libraries (*.kicad_symdir)|*.kicad_symdir|")
+               + wxT("Legacy symbol libraries (*.lib)|*.lib");
     else
-        filter = wxT("Legacy (*.mod)|*.mod|Legacy (mm) (*.mod)|*.mod|s-expression|*.pretty");
+        filter = wxString(wxT("KiCad footprint libraries (*.pretty)|*.pretty|"))
+               + wxT("Legacy (mm) (*.mod)|*.mod|Legacy (mil) (*.mod)|*.mod");
     wxFileDialog* dlg = new wxFileDialog(this, wxT("New library..."),
                                          wxEmptyString, wxEmptyString,
                                          filter, wxFD_SAVE);
-    if (!SymbolMode)
-        dlg->SetFilterIndex(1); /* by default, create libraries in legacy version 2 format */
     if (dlg->ShowModal() != wxID_OK)
         return;
     /* set default extension */
     wxFileName fname(dlg->GetPath());
     if (fname.GetExt().length() == 0) {
         if (SymbolMode)
-            fname.SetExt(wxT("lib"));
-        else if (dlg->GetFilterIndex() <= 1)
-            fname.SetExt(wxT("mod"));
+            fname.SetExt(dlg->GetFilterIndex() == 1 ? wxT("kicad_symdir")
+                                                    : (dlg->GetFilterIndex() == 2 ? wxT("lib") : wxT("kicad_sym")));
         else
-            fname.SetExt(wxT("pretty"));
+            fname.SetExt(dlg->GetFilterIndex() == 0 ? wxT("pretty") : wxT("mod"));
     }
 
-    if (dlg->GetFilterIndex() <= 1) {
+    if (SymbolMode && fname.GetExt().CmpNoCase(wxT("kicad_symdir")) == 0) {
+        if (!wxMkdir(fname.GetFullPath())) {
+            wxMessageBox(wxT("Failed to create library ") + fname.GetFullPath());
+            return;
+        }
+    } else if (!SymbolMode && fname.GetExt().CmpNoCase(wxT("pretty")) == 0) {
+        if (!wxMkdir(fname.GetFullPath())) {
+            wxMessageBox(wxT("Failed to create library ") + fname.GetFullPath());
+            return;
+        }
+    } else {
         wxTextFile file;
         if (!file.Create(fname.GetFullPath())) {
             if (!file.Open(fname.GetFullPath())) {
@@ -397,7 +415,13 @@ void libmngrFrame::OnNewLibrary(wxCommandEvent& /*event*/)
             }
         }
         file.Clear();
-        if (SymbolMode) {
+        if (SymbolMode && fname.GetExt().CmpNoCase(wxT("kicad_sym")) == 0) {
+            file.AddLine(wxT("(kicad_symbol_lib"));
+            file.AddLine(wxT("  (version 20251024)"));
+            file.AddLine(wxT("  (generator kicad_librarian)"));
+            file.AddLine(wxT("  (generator_version \"1.5\")"));
+            file.AddLine(wxT(")"));
+        } else if (SymbolMode) {
             file.AddLine(wxT("EESchema-LIBRARY Version 2.3  Date: ") + wxNow());
             file.AddLine(wxT("#encoding utf-8"));
             file.AddLine(wxT("#"));
@@ -413,12 +437,6 @@ void libmngrFrame::OnNewLibrary(wxCommandEvent& /*event*/)
         }
         file.Write();
         file.Close();
-    } else {
-        wxASSERT(!SymbolMode);
-        if (!wxMkdir(fname.GetFullPath())) {
-            wxMessageBox(wxT("Failed to create library ") + fname.GetFullPath());
-            return;
-        }
     }
 
     /* get current selections in the left and right combo-boxes */
@@ -1407,6 +1425,22 @@ void libmngrFrame::OnMovePart(wxCommandEvent& /*event*/)
     wxASSERT(target.length() > 0);
 
     if (SymbolMode) {
+        if (IsModernSymbolLibraryPath(source) != IsModernSymbolLibraryPath(target)) {
+            wxMessageBox(wxT("Conversion between legacy and modern symbol formats is not supported; both libraries must use the same format."));
+            return;
+        }
+        if (SymbolHasDependents(source, modname)) {
+            wxMessageBox(wxT("This symbol is a parent of other symbols and cannot be moved by itself. Copy it instead, or move its dependent symbols first."));
+            return;
+        }
+        /* Modern symbols may inherit graphics and pins from another symbol in
+           the same library. Copy that dependency chain before the child so the
+           target never contains a dangling `extends` reference. Parents stay
+           in the source on a move because other source symbols may need them. */
+        if (!CopySymbolDependencies(source, target, modname)) {
+            wxMessageBox(wxT("Unable to copy the symbol because one of its parent symbols is missing or invalid."));
+            return;
+        }
         /* first remove the symbol from the target library (if it exists) */
         if (ExistSymbol(target, modname)) {
             if (ConfirmOverwrite
@@ -1571,6 +1605,14 @@ void libmngrFrame::OnCopyPart(wxCommandEvent& /*event*/)
     wxASSERT(target.CmpNoCase(LIB_ALL) != 0);
 
     if (SymbolMode) {
+        if (IsModernSymbolLibraryPath(source) != IsModernSymbolLibraryPath(target)) {
+            wxMessageBox(wxT("Conversion between legacy and modern symbol formats is not supported; both libraries must use the same format."));
+            return;
+        }
+        if (!CopySymbolDependencies(source, target, modname)) {
+            wxMessageBox(wxT("Unable to copy the symbol because one of its parent symbols is missing or invalid."));
+            return;
+        }
         /* first remove the symbol from the target library (if it exists) */
         if (ExistSymbol(target, modname)) {
             if (ConfirmOverwrite
@@ -1874,6 +1916,10 @@ void libmngrFrame::OnDuplicatePart(wxCommandEvent& /*event*/)
                     /* create full names for source and target, then copy the file */
                     wxFileName old_fname(filename, modname + wxT(".kicad_mod"));
                     wxFileName new_fname(filename, newname + wxT(".kicad_mod"));
+                    if (filename.Right(10).CmpNoCase(wxT(".kicad_mod")) == 0) {
+                        old_fname.Assign(filename);
+                        new_fname.Assign(old_fname.GetPath(), newname, wxT("kicad_mod"));
+                    }
                     result = wxCopyFile(old_fname.GetFullPath(), new_fname.GetFullPath(), true);
                     /* adjust fields in the new file to newname */
                     wxTextFile file;
@@ -2389,6 +2435,8 @@ void libmngrFrame::DrawSymbols(wxGraphicsContext *gc, int midx, int midy, const 
             continue;
         if (PartData[fp].Count() == 0)
             continue;
+        const wxArrayString& symbolData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
         /* Draw the outline, plus optionally the texts */
         if (fp == 0) {
             clrForeground.Set(128, 16, 16, transp[fp]);
@@ -2406,8 +2454,8 @@ void libmngrFrame::DrawSymbols(wxGraphicsContext *gc, int midx, int midy, const 
             bool indraw = false;
             double pinname_offset = size_pinshape;
             bool show_pinnr = true, show_pinname = true;
-            for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-                wxString line = PartData[fp][idx];
+            for (int idx = 0; idx < (int)symbolData.Count(); idx++) {
+                wxString line = symbolData[idx];
                 wxASSERT(line.Length() > 0);
                 if (line[0] == wxT('#'))
                     continue;
@@ -3005,6 +3053,8 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
             continue;
         if (PartData[fp].Count() == 0)
             continue;
+        const wxArrayString& footprintData = UseFootprintPreviewData[fp]
+            ? FootprintPreviewData[fp] : PartData[fp];
         if (fp == 0) {
             clrBody.Set(192, 192, 96, transp[fp]);
             clrPad.Set(160, 0, 0, transp[fp]);
@@ -3030,8 +3080,8 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
         gc->SetBrush(*wxTRANSPARENT_BRUSH);
         bool unit_mm = Footprint[fp].Type >= VER_MM;
         double module_angle = 0;    /* all angles should be corrected with the footprint angle */
-        for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-            wxString line = PartData[fp][idx];
+        for (int idx = 0; idx < (int)footprintData.Count(); idx++) {
+            wxString line = footprintData[idx];
             wxString token = GetToken(&line);
             if (token.CmpNoCase(wxT("Po")) == 0) {
                 GetToken(&line);    /* ignore X position */
@@ -3125,7 +3175,7 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
                 wxASSERT(pt != NULL);
                 for (long p = 0; p < count; p++) {
                     idx++;
-                    line = PartData[fp][idx];
+                    line = footprintData[idx];
                     token = GetToken(&line);
                     wxASSERT(token.CmpNoCase(wxT("Dl")) == 0);
                     double x = GetTokenDim(&line, unit_mm);
@@ -3393,13 +3443,16 @@ void libmngrFrame::DrawFootprints(wxGraphicsContext *gc, int midx, int midy, con
         bool padsmd = false, padbottomside = false;
         wxPoint2DDouble pastepoints[5];
         wxString padpin, padshape;
-        for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-            wxString line = PartData[fp][idx];
+        for (int idx = 0; idx < (int)footprintData.Count(); idx++) {
+            wxString line = footprintData[idx];
             if (line[0] == wxT('$')) {
                 if (line.CmpNoCase(wxT("$PAD")) == 0) {
                     inpad = true;
                     drillwidth = drillheight = 0;
                     pasteratio = 0.0;
+                    paddeltax = paddeltay = 0.0;
+                    padrratio = 0.5;
+                    padsmd = padbottomside = false;
                 } else if (line.CmpNoCase(wxT("$EndPAD")) == 0) {
                     wxBrush *brushPad = padbottomside ? &brushRev : &brushStd;
                     wxPen *penPad = padbottomside ? &penRev : &penStd;
@@ -4181,6 +4234,21 @@ void libmngrFrame::CollectLibraries(const wxString &path, wxArrayString *list)
     if (SymbolMode) {
         dir.GetAllFiles(path, list, wxT("*.lib"), wxDIR_FILES);
         dir.GetAllFiles(path, list, wxT("*.sym"), wxDIR_FILES);
+        wxArrayString packedLibraries;
+        dir.GetAllFiles(path, &packedLibraries, wxT("*.kicad_sym"), wxDIR_FILES);
+        for (size_t idx = 0; idx < packedLibraries.Count(); idx++) {
+            wxFileName packed(packedLibraries[idx]);
+            wxFileName parent = wxFileName::DirName(packed.GetPath());
+            if (parent.GetExt().CmpNoCase(wxT("kicad_symdir")) != 0)
+                list->Add(packedLibraries[idx]);
+        }
+        wxString basename;
+        bool cont = dir.GetFirst(&basename, wxEmptyString, wxDIR_DIRS);
+        while (cont) {
+            if (wxFileName(basename).GetExt().CmpNoCase(wxT("kicad_symdir")) == 0)
+                list->Add(path + wxT(DIRSEP_STR) + basename);
+            cont = dir.GetNext(&basename);
+        }
     } else {
         dir.GetAllFiles(path, list, wxT("*.mod"), wxDIR_FILES);
         dir.GetAllFiles(path, list, wxT("*.emp"), wxDIR_FILES);
@@ -4207,9 +4275,10 @@ public:
         return wxDIR_CONTINUE;
     }
     virtual wxDirTraverseResult OnDir(const wxString& dirname) wxOVERRIDE {
-        /* do not add directories ending with ".pretty" because they are
-           actually libraries */
-        if (dirname.AfterLast('.').CmpNoCase(wxT("pretty")) != 0)
+        /* Do not recurse into directory-based libraries. */
+        wxString extension = dirname.AfterLast('.');
+        if (extension.CmpNoCase(wxT("pretty")) != 0
+            && extension.CmpNoCase(wxT("kicad_symdir")) != 0)
             m_pathlist->Add(dirname);
         return wxDIR_CONTINUE;
     }
@@ -4531,6 +4600,34 @@ void libmngrFrame::CollectSymbols(const wxString &path, wxListCtrl* list, const 
         libname = fname.GetFullName();
     }
 
+    wxArrayString modernNames;
+    if (GetSymbolNames(path, &modernNames)) {
+        m_statusBar->SetStatusText(wxT("Scanning ") + path);
+        if (progress && modernNames.Count() > 0)
+            progress->SetRange(modernNames.Count());
+        for (size_t idx = 0; idx < modernNames.Count(); idx++) {
+            wxString name = modernNames[idx];
+            bool match = filter.IsEmpty() || name.Lower().Find(filter) >= 0;
+            if (!match) {
+                wxArrayString symbol;
+                if (LoadSymbol(path, name, wxEmptyString, false, &symbol)) {
+                    wxString metadata = GetDescription(symbol, true) + wxT(" ")
+                        + GetKeywords(symbol, true) + wxT(" ") + GetFootprints(symbol);
+                    match = metadata.Lower().Find(filter) >= 0;
+                }
+            }
+            if (match) {
+                long insertpos = GetListPosition(name, list);
+                long item = list->InsertItem(insertpos, name);
+                list->SetItem(item, 1, libname);
+                list->SetItem(item, 2, path);
+            }
+            if (progress)
+                progress->Update(idx + 1);
+        }
+        return;
+    }
+
     wxTextFile file;
     if (!file.Open(path)) {
         wxMessageBox(wxT("Failed to open symbol library ") + path);
@@ -4570,11 +4667,11 @@ void libmngrFrame::CollectSymbols(const wxString &path, wxListCtrl* list, const 
                 if (!match && LoadSymbol(path, name, wxEmptyString, false, &symbol)) {
                     wxString field = GetDescription(symbol, true);
                     field.MakeLower();
-                    if (line.Find(filter) >= 0)
+                    if (field.Find(filter) >= 0)
                         match = true;
                     field = GetAliases(symbol);
                     field.MakeLower();
-                    if (line.Find(filter) >= 0)
+                    if (field.Find(filter) >= 0)
                         match = true;
                 }
             }
@@ -4630,7 +4727,12 @@ bool libmngrFrame::MatchFootprint(const wxString& libname, const wxString& symna
         if (LoadFootprint(libname, symname, wxEmptyString, false, &footprint, &version)) {
             unqlite_close(pDb); /* close the database, for caching the data */
             FootprintInfo fp(version);
-            TranslatePadInfo(&footprint, &fp);
+            if (version == VER_S_EXPR) {
+                wxArrayString preview;
+                ConvertModernFootprintToLegacyPreview(footprint, &preview, &fp);
+            } else {
+                TranslatePadInfo(&footprint, &fp);
+            }
             CacheMetadata(libname, symname, true, footprint, fp);
             /* re-open the database */
             rc = unqlite_open(&pDb, path.c_str(), UNQLITE_OPEN_CREATE);
@@ -4858,6 +4960,10 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
 {
     m_statusBar->SetStatusText(wxEmptyString);
     PartData[fp].Clear();
+    SymbolPreviewData[fp].Clear();
+    UseSymbolPreviewData[fp] = false;
+    FootprintPreviewData[fp].Clear();
+    UseFootprintPreviewData[fp] = false;
 
     /* get the name of the symbol and the library it is in */
     wxString symbol = list->GetItemText(index);
@@ -4923,6 +5029,13 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
                 wxMessageBox(wxT("Failed to open library ") + filename);
             else
                 wxMessageBox(wxT("Symbol ") + symbol + wxT(" is not present."));
+        } else if (IsModernSymbolLibraryPath(filename)) {
+            wxString previewError;
+            if (LoadModernSymbolPreview(filename, symbol, &SymbolPreviewData[fp], &previewError)) {
+                UseSymbolPreviewData[fp] = true;
+            } else {
+                m_statusBar->SetStatusText(wxT("Preview unavailable: ") + previewError);
+            }
         }
     } else {
         if (!LoadFootprint(filename, symbol, author, DontRebuildTemplate, &PartData[fp], &version)) {
@@ -4950,22 +5063,39 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
         PinDataCount[fp] = 0;
     }
     if (SymbolMode) {
+        const wxArrayString& displayData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
         /* extract pin names and order */
-        GetPinNames(PartData[fp], NULL, &PinDataCount[fp]);
+        GetPinNames(displayData, NULL, &PinDataCount[fp]);
         if (PinDataCount[fp] > 0) {
             PinData[fp] = new PinInfo[PinDataCount[fp]];
             wxASSERT(PinData[fp] != NULL);
-            GetPinNames(PartData[fp], PinData[fp], NULL);
+            GetPinNames(displayData, PinData[fp], NULL);
         }
     } else {
         /* get the pin pitch and pad size, plus the body size */
         Footprint[fp].Type = version;
-        TranslatePadInfo(&PartData[fp], &Footprint[fp]);
+        if (version == VER_S_EXPR) {
+            wxString previewError;
+            if (ConvertModernFootprintToLegacyPreview(PartData[fp],
+                    &FootprintPreviewData[fp], &Footprint[fp], &previewError))
+            {
+                UseFootprintPreviewData[fp] = true;
+            } else {
+                m_statusBar->SetStatusText(wxT("Preview unavailable: ") + previewError);
+            }
+        } else {
+            TranslatePadInfo(&PartData[fp], &Footprint[fp]);
+        }
         /* optionally cache the metadata (pitch, courtyard, descriptions) */
         CacheMetadata(filename, symbol, false, PartData[fp], Footprint[fp]);
     }
-    GetBodySize(PartData[fp], &BodySize[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
-    GetTextLabelSize(PartData[fp], &LabelData[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
+    const wxArrayString& displayData = SymbolMode && UseSymbolPreviewData[fp]
+        ? SymbolPreviewData[fp]
+        : (!SymbolMode && UseFootprintPreviewData[fp]
+            ? FootprintPreviewData[fp] : PartData[fp]);
+    GetBodySize(displayData, &BodySize[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
+    GetTextLabelSize(displayData, &LabelData[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
     if (SymbolMode) {
         /* re-assign the pins to custom sections (now that the body size is known) */
         wxString templatename = GetTemplateName(PartData[fp]);
@@ -6344,8 +6474,7 @@ bool libmngrFrame::SavePart(int index, wxListCtrl* list)
             }
         }
         wxASSERT(ExistSymbol(filename, symbol));
-        RemoveSymbol(filename, symbol);
-        result = InsertSymbol(filename, symbol, PartData[0]);
+        result = SaveSymbol(filename, symbol, PartData[0]);
     } else {
         int targettype = LibraryType(filename);
         wxArrayString module;
@@ -6584,7 +6713,7 @@ bool libmngrFrame::SetVarsFromFields(RPNexpression *rpn, bool SymbolMode)
             shape = wxT("trapezoid");
         else if (shape.CmpNoCase(wxT("Rounded rectangle")) == 0)
             shape = wxT("roundrect");
-        rpn->SetVariable(RPNvariable("$PSH", shape));
+        rpn->SetVariable(RPNvariable("$PSH", shape.mb_str()));
         field = m_txtPadRadius->GetValue();
         if (field.length() > 0 && field.ToLong(&val))
             rpn->SetVariable(RPNvariable("$PRR", val / 100.0));
@@ -6875,7 +7004,9 @@ void libmngrFrame::UpdateDetails(int fp)
         }
         SetTextField(m_txtPadCount, wxString::Format(wxT("%d"), PinDataCount[fp]), enable ? ENABLED : PROTECTED);
 
-        int unitcount = GetUnitCount(PartData[fp]);
+        const wxArrayString& displayData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
+        int unitcount = GetUnitCount(displayData);
         enable = unitcount > 1 && DefEnable;
         m_spinUnitSelect->SetRange(1, unitcount);
         m_spinUnitSelect->SetValue(SymbolUnitNumber[fp]);

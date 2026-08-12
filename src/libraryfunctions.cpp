@@ -27,13 +27,16 @@
 #include <wx/string.h>
 #include <wx/textfile.h>
 #include <math.h>
+#include <algorithm>
+#include <vector>
 #include "librarymanager.h"
+#include "libmngr_paths.h"
+#include "kicadsexpr.h"
 #include "libraryfunctions.h"
 #if !defined NO_CURL
     #include "remotelink.h"
 #endif
 
-#define EoC     '\x1a'  /* special "end-of-comment" character */
 #define MM(d)       (d)
 #define MIL10(d)    (long)floor(d / 0.00254 + 0.5)
 
@@ -61,6 +64,32 @@ WX_DEFINE_OBJARRAY(ArrayCoordSize);
         string.replace(start, length, sub.c_str());
     }
 #endif
+
+struct KiCadReplacement {
+    size_t start;
+    size_t end;
+    wxString value;
+};
+
+static bool ReplacementDescending(const KiCadReplacement& first,
+                                  const KiCadReplacement& second)
+{
+    return first.start > second.start;
+}
+
+static void ApplyReplacements(wxString* text, std::vector<KiCadReplacement>* replacements)
+{
+    std::sort(replacements->begin(), replacements->end(), ReplacementDescending);
+    for (size_t idx = 0; idx < replacements->size(); idx++) {
+        const KiCadReplacement& replacement = (*replacements)[idx];
+        ReplaceKiCadRange(text, replacement.start, replacement.end, replacement.value);
+    }
+}
+
+static wxString ReplacementAtom(const KiCadSexprAtom& atom, const wxString& value)
+{
+    return atom.quoted ? QuoteKiCadString(value) : value;
+}
 
 
 /* strips trailing zeros from a number; the input string should only contain a number */
@@ -642,14 +671,17 @@ void TranslateToSexpr(wxArrayString* output, const wxArrayString& module)
                 }
             }
             wxString newline;
-            newline = wxString::Format(wxT("(module \"%s\""), name.c_str());
-            if (layer >= 0)
-                newline += wxString::Format(wxT(" (layer %s)"), LayerName(layer));
+            newline = wxString::Format(wxT("(footprint \"%s\""), name.c_str());
             if (locked > 0)
                 newline += wxT(" locked");
             if (placed > 0)
                 newline += wxT(" placed");
             output->Add(newline);
+            output->Add(wxT("(version 20240108)"));
+            output->Add(wxT("(generator \"kicad_librarian\")"));
+            output->Add(wxT("(generator_version \"1.5\")"));
+            if (layer >= 0)
+                output->Add(wxString::Format(wxT("(layer \"%s\")"), LayerName(layer)));
             if (timestamp > 0) {
                 newline = wxString::Format(wxT("(tedit %X)"), timestamp);
                 output->Add(newline);
@@ -1011,7 +1043,8 @@ void TranslateToLegacy(wxArrayString* output, const wxArrayString& module)
         if (keyword[0] != '(')
             continue;
         keyword = keyword.Mid(1);
-        if (keyword.CmpNoCase(wxT("module")) == 0) {
+        if (keyword.CmpNoCase(wxT("module")) == 0
+            || keyword.CmpNoCase(wxT("footprint")) == 0) {
             symbolname = GetToken(&line);
             symbolname = symbolname.AfterLast(wxT(':'));
             bool islocked = false;
@@ -1027,7 +1060,7 @@ void TranslateToLegacy(wxArrayString* output, const wxArrayString& module)
             wxString cmptype = wxT("STD");
             /* get other information needed for the header lines */
             for (unsigned idx2 = idx + 1; idx2 < module.Count(); idx2++) {
-                wxString line = module[idx];
+                wxString line = module[idx2];
                 wxString keyword = GetToken(&line);
                 if (keyword[0] != '(')
                     continue;
@@ -1692,7 +1725,8 @@ int AdjustPad(wxArrayString& module, FootprintInfo* current, const FootprintInfo
         for (idx = 0; type == VER_INVALID && idx < module.Count(); idx++) {
             wxString line = module[0];  /* check whether this is s-exprssion or legacy */
             wxString keyword = GetToken(&line);
-            if (keyword.CmpNoCase(wxT("(module")) == 0)
+            if (keyword.CmpNoCase(wxT("(module")) == 0
+                || keyword.CmpNoCase(wxT("(footprint")) == 0)
                 type = VER_S_EXPR;
             else if (keyword.CmpNoCase(wxT("$MODULE")) == 0)
                 type = VER_MM;          /* for the attribute, it does not matter whether the type is VER_MM or VER_MIL */
@@ -2328,6 +2362,42 @@ bool RemoveFootprint(const wxString& filename, const wxString& name)
 /* For footprints */
 bool RenameFootprint(wxArrayString* module, const wxString& oldname, const wxString& newname)
 {
+    wxString modern = KiCadLinesToText(*module);
+    std::vector<KiCadSexprNode> nodes;
+    if (ParseKiCadSexpr(modern, &nodes)) {
+        int root = FindKiCadSexprRoot(nodes, wxT("footprint"));
+        if (root < 0)
+            root = FindKiCadSexprRoot(nodes, wxT("module"));
+        if (root >= 0 && !nodes[root].atoms.empty()) {
+            std::vector<KiCadReplacement> replacements;
+            if (nodes[root].atoms[0].value.CmpNoCase(oldname) == 0) {
+                KiCadReplacement replacement;
+                replacement.start = nodes[root].atoms[0].start;
+                replacement.end = nodes[root].atoms[0].end;
+                replacement.value = ReplacementAtom(nodes[root].atoms[0], newname);
+                replacements.push_back(replacement);
+            }
+            for (size_t idx = 0; idx < nodes.size(); idx++) {
+                const KiCadSexprNode& node = nodes[idx];
+                bool valueProperty = node.parent == root && node.head == wxT("property")
+                    && node.atoms.size() >= 2 && node.atoms[0].value == wxT("Value")
+                    && node.atoms[1].value.CmpNoCase(oldname) == 0;
+                bool valueText = node.parent == root && node.head == wxT("fp_text")
+                    && node.atoms.size() >= 2 && node.atoms[0].value == wxT("value")
+                    && node.atoms[1].value.CmpNoCase(oldname) == 0;
+                if (valueProperty || valueText) {
+                    KiCadReplacement replacement;
+                    replacement.start = node.atoms[1].start;
+                    replacement.end = node.atoms[1].end;
+                    replacement.value = ReplacementAtom(node.atoms[1], newname);
+                    replacements.push_back(replacement);
+                }
+            }
+            ApplyReplacements(&modern, &replacements);
+            KiCadTextToLines(modern, module);
+            return true;
+        }
+    }
     for (int idx = 0; idx < (int)module->Count(); idx++) {
         wxString line = (*module)[idx];
         wxString keyword = GetToken(&line);
@@ -2339,7 +2409,7 @@ bool RenameFootprint(wxArrayString* module, const wxString& oldname, const wxStr
         } else if (keyword.CmpNoCase(wxT("T0")) == 0
                              || keyword.Cmp(wxT("Na")) == 0
                              || keyword.Cmp(wxT("(module")) == 0
-                             || keyword.Cmp(wxT("(model")) == 0
+                             || keyword.Cmp(wxT("(footprint")) == 0
                              || keyword.Cmp(wxT("(fp_text")) == 0
                              )
         {
@@ -2367,9 +2437,14 @@ bool RenameFootprint(const wxString& filename, const wxString& oldname, const wx
             msg = curlDelete(oldname, wxT("footprints"));
             return msg.length() == 0;
         #endif
-    } else if (wxFileName::DirExists(filename)) {
+    } else if (wxFileName::DirExists(filename)
+               || filename.Right(10).CmpNoCase(wxT(".kicad_mod")) == 0) {
         wxFileName old_fname(filename, oldname + wxT(".kicad_mod"));
         wxFileName new_fname(filename, newname + wxT(".kicad_mod"));
+        if (!wxFileName::DirExists(filename)) {
+            old_fname.Assign(filename);
+            new_fname.Assign(old_fname.GetPath(), newname, wxT("kicad_mod"));
+        }
         if (!wxRenameFile(old_fname.GetFullPath(), new_fname.GetFullPath(), true))
             return false;
         wxTextFile file;
@@ -2511,79 +2586,33 @@ bool LoadFootprint(const wxString& filename, const wxString& name, const wxStrin
             } else {
                 mod_name = filename;
             }
-            if (!file.Open(mod_name))
+            wxString total;
+            std::vector<KiCadSexprNode> nodes;
+            if (!ReadKiCadTextFile(mod_name, &total) || !ParseKiCadSexpr(total, &nodes))
                 return false;
+            int root = FindKiCadSexprRoot(nodes, wxT("footprint"));
+            if (root < 0)
+                root = FindKiCadSexprRoot(nodes, wxT("module"));
+            if (root < 0 || nodes[root].end == 0)
+                return false;
+
             *version = VER_S_EXPR;
-            /* s-expression is a free-format; for ease of parsing, the contents are
-                 reformatted; the first step is to gather all data in a single (long)
-                 string */
-            wxString total = wxEmptyString;
-            wxString line;
-            for (unsigned idx = 0; idx < file.GetLineCount(); idx++) {
-                line = file.GetLine(idx);
-                line.Trim(false);           /* remove leading and trailing white-space */
-                line.Trim(true);
-                if (total.length() > 0 && line.length() > 0 && line[0] != wxT(')'))
-                    total += wxT(" ");  /* put one space between sections/keywords */
-                total += line;
-                if (line.Find(wxT('#')) >= 0)
-                    total += wxT(EoC);  /* if a comment appears in the string, append a special "end-of-comment" token */
+            size_t firstChild = nodes[root].end - 1;
+            for (size_t idx = 0; idx < nodes.size(); idx++) {
+                if (nodes[idx].parent == root && nodes[idx].start < firstChild)
+                    firstChild = nodes[idx].start;
             }
-            file.Close();
-            /* remove spaces after a '(' (KiCad does not generate these, so it is merely
-                 to be extra sure) */
-            total.Replace(wxT("( "), wxT("("));
-            /* handle any leading comments */
-            while (total[0] == wxT('#')) {
-                int pos = total.Find(wxT(EoC));
-                wxASSERT(pos > 0);
-                line = total.Left(pos);
-                module->Add(line);
-                total = total.Mid(pos + 1);
-            }
-            /* reformat with only a single "indentation level" (although no indentation
-                 is added) */
-            total.Trim(true);   /* trim trailing */
-            total.Trim(false);  /* trim leading */
-            wxASSERT(total[0] == wxT('('));
-            unsigned start = 1;
-            bool instring = false;
-            while (start < total.length() && (!(total[start] == wxT('(') || total[start] == wxT(')')) || instring)) {
-                if (total[start] == wxT('"'))
-                    instring = !instring;
-                start++;
-            }
-            line = total.Left(start);
-            line.Trim(true);
-            module->Add(line);
-            total = total.Mid(start);
-            total.Trim(false);
-            while (total[0] != wxT(')')) {
-                wxASSERT(total[0] == wxT('('));
-                int level = 0;
-                instring = false;
-                for (start = 1; start < total.length() && level >= 0; start++) {
-                    if (total[start] == wxT('"'))
-                        instring = !instring;
-                    if (total[start] == wxT('(') && !instring)
-                        level++;
-                    else if (total[start] == wxT(')') && !instring)
-                        level--;
+            wxString header = total.Mid(nodes[root].start, firstChild - nodes[root].start);
+            header.Trim(true);
+            module->Add(header);
+            for (size_t idx = 0; idx < nodes.size(); idx++) {
+                if (nodes[idx].parent == root) {
+                    module->Add(total.Mid(nodes[idx].start,
+                                          nodes[idx].end - nodes[idx].start));
                 }
-                line = total.Left(start);
-                /* remove comments (right now, we only support header comments) */
-                int pos;
-                while ((pos = line.Find(wxT('#'))) >= 0) {
-                    int pos2 = line.Find(wxT(EoC));
-                    wxASSERT(pos2 > pos);
-                    line.Remove(pos, pos2 - pos + 1);
-                }
-                module->Add(line);
-                total = total.Mid(start);
-                total.Trim(false);  /* remove the space after the closing ')' */
             }
-            module->Add(total); /* this is the final ')' that closes the module definition */
-            result = (module->Count() > 0);
+            module->Add(wxT(")"));
+            result = true;
         } else {
             /* legacy library, open the library */
             if (!file.Open(filename))
@@ -2959,7 +2988,7 @@ bool FootprintFromTemplate(wxArrayString* module, const wxArrayString& templat,
             rpn.Set("$PSH");
             if (rpn.Parse() == RPN_OK) {
                 wxString shape = rpn.Value().Text();
-                rpn.SetVariable(RPNvariable("PSH", TranslatePadShape(shape, pad, legacy)));
+                rpn.SetVariable(RPNvariable("PSH", TranslatePadShape(shape, pad, legacy).mb_str()));
                 double rratio = -1;
                 if (shape.Cmp(wxT("roundrect")) == 0) {
                     rpn.Set("$PRR");
@@ -3144,20 +3173,33 @@ wxString GetVRMLPath(const wxString& library, const wxArrayString& module)
 {
     wxString rpath = wxEmptyString;
 
-    /* check that there is a VRML file in the module */
+    /* Modern footprints store WRL and STEP paths in a (model ...) expression.
+       Parse it structurally so indentation and line wrapping do not matter. */
+    wxString modern = KiCadLinesToText(module);
+    std::vector<KiCadSexprNode> nodes;
+    if (ParseKiCadSexpr(modern, &nodes)) {
+        for (size_t idx = 0; idx < nodes.size(); idx++) {
+            if (nodes[idx].head == wxT("model") && !nodes[idx].atoms.empty()) {
+                rpath = nodes[idx].atoms[0].value;
+                break;
+            }
+        }
+    }
+
+    /* Legacy modules keep the model name in $SHAPE3D/Na. */
     bool in3dshape = false;
-    for (unsigned idx = 0; idx < module.Count(); idx++) {
+    for (unsigned idx = 0; rpath.IsEmpty() && idx < module.Count(); idx++) {
         wxString line = module[idx];
         wxString token = GetToken(&line);
         if (in3dshape && token.CmpNoCase(wxT("Na")) == 0)
             rpath = GetToken(&line);
         else if (token.Cmp(wxT("$SHAPE3D")) == 0)
             in3dshape = true;
-        else if (token.Cmp(wxT("(module")) == 0)
-            rpath = GetToken(&line);
     }
     if (rpath.length() == 0)
         return wxEmptyString;
+
+    rpath = ResolveKiCadPathVariables(rpath, KICAD_PATH_3DMODELS);
 
     if (library.CmpNoCase(LIB_REPOS) == 0) {
         /* for the repository, use only the base name of the library (ignore any
@@ -3170,7 +3212,9 @@ wxString GetVRMLPath(const wxString& library, const wxArrayString& module)
     } else {
         /* for local libraries, first check whether the "relative" path actually is
            an absolute path (there is nothing to do in that case) */
-        if (rpath[0] != '/' && (rpath.length() < 3 || rpath[1] != ':' || (rpath[2] != '\\' && rpath[2] != '/'))) {
+        wxFileName modelname(rpath);
+        bool unresolvedVariable = rpath.StartsWith(wxT("${")) || rpath.StartsWith(wxT("$("));
+        if (!modelname.IsAbsolute() && !unresolvedVariable) {
             /* so it is a true relative path; strip the filename from the local
                library path, add the "packages3d" path and the relative path */
             int idx = library.Find('/', true);
@@ -3180,17 +3224,19 @@ wxString GetVRMLPath(const wxString& library, const wxArrayString& module)
                 rpath = library.Left(idx + 1) + wxT("packages3d/") + rpath;
         }
         /* adhere to the proper path separations */
-        rpath.Replace(wxT("\\\\"), wxT("\\"));
         #if DIRSEP_CHAR != '/'
             rpath.Replace(wxT("/"), wxT(DIRSEP_STR));
         #endif
         #if DIRSEP_CHAR != '\\'
             rpath.Replace(wxT("\\"), wxT(DIRSEP_STR));
         #endif
-        /* add the extension, if not present */
-        if (rpath.Length() < 4 || rpath.Right(4).CmpNoCase(wxT(".wrl")) != 0)
-            rpath = rpath + wxT(".wrl");
     }
+
+    /* Legacy records often omit .wrl. Keep every existing extension, notably
+       .step and .stp, and only apply the old default when there is none. */
+    wxFileName modelname(rpath);
+    if (modelname.GetExt().IsEmpty())
+        rpath += wxT(".wrl");
 
     return rpath;
 }
@@ -3252,7 +3298,7 @@ bool CopyVRMLfile(const wxString& source, const wxString& target,
         wxFileName fname(targetpath);
         if (!wxDirExists(fname.GetPath()))
             wxFileName::Mkdir(fname.GetPath(), 0777, wxPATH_MKDIR_FULL);
-        result = ::wxCopyFile(sourcepath, targetpath);
+        result = ::wxCopyFile(sourcepath, targetpath, true);
     }
     return result;
 }
@@ -3692,9 +3738,67 @@ wxString GetTemplateName(const wxArrayString& module)
     return name;
 }
 
+static bool GetModernSymbolProperty(const wxArrayString& symbol, const wxString& key,
+                                    wxString* value)
+{
+    wxString text = KiCadLinesToText(symbol);
+    std::vector<KiCadSexprNode> nodes;
+    if (!ParseKiCadSexpr(text, &nodes))
+        return false;
+    int root = FindKiCadSexprRoot(nodes, wxT("symbol"));
+    if (root < 0)
+        return false;
+    for (size_t idx = 0; idx < nodes.size(); idx++) {
+        if (nodes[idx].parent == root && nodes[idx].head == wxT("property")
+            && nodes[idx].atoms.size() >= 2 && nodes[idx].atoms[0].value == key)
+        {
+            *value = nodes[idx].atoms[1].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SetModernSymbolProperty(wxArrayString* symbol, const wxString& key,
+                                    const wxString& value)
+{
+    wxString text = KiCadLinesToText(*symbol);
+    std::vector<KiCadSexprNode> nodes;
+    if (!ParseKiCadSexpr(text, &nodes))
+        return false;
+    int root = FindKiCadSexprRoot(nodes, wxT("symbol"));
+    if (root < 0)
+        return false;
+    for (size_t idx = 0; idx < nodes.size(); idx++) {
+        if (nodes[idx].parent == root && nodes[idx].head == wxT("property")
+            && nodes[idx].atoms.size() >= 2 && nodes[idx].atoms[0].value == key)
+        {
+            ReplaceKiCadRange(&text, nodes[idx].atoms[1].start,
+                              nodes[idx].atoms[1].end, QuoteKiCadString(value));
+            KiCadTextToLines(text, symbol);
+            return true;
+        }
+    }
+    if (value.IsEmpty())
+        return true;
+
+    wxString property = wxT("\n  (property ") + QuoteKiCadString(key) + wxT(" ")
+        + QuoteKiCadString(value)
+        + wxT("\n    (at 0 0 0)\n    (show_name no)\n    (do_not_autoplace no)")
+        + wxT("\n    (hide yes)\n    (effects (font (size 1.27 1.27)))\n  )");
+    ReplaceKiCadRange(&text, nodes[root].end - 1, nodes[root].end - 1, property);
+    KiCadTextToLines(text, symbol);
+    return true;
+}
+
 /* For symbols and footprints */
 wxString GetDescription(const wxArrayString& module, bool symbolmode)
 {
+    if (symbolmode) {
+        wxString value;
+        if (GetModernSymbolProperty(module, wxT("Description"), &value))
+            return value;
+    }
     /* although it is possible to detect whether the "module" contains a footprint
        or a symbol, it is probably best not to try */
     for (unsigned idx = 0; idx < module.Count(); idx++) {
@@ -3715,6 +3819,12 @@ wxString GetDescription(const wxArrayString& module, bool symbolmode)
 /* For symbols and footprints */
 bool SetDescription(wxArrayString& module, const wxString& description, bool symbolmode)
 {
+    if (symbolmode) {
+        wxString text = KiCadLinesToText(module);
+        std::vector<KiCadSexprNode> nodes;
+        if (ParseKiCadSexpr(text, &nodes) && FindKiCadSexprRoot(nodes, wxT("symbol")) >= 0)
+            return SetModernSymbolProperty(&module, wxT("Description"), description);
+    }
     /* although it is possible to detect whether the "module" contains a footprint
          or a symbol, it is probably best not to try */
     for (unsigned idx = 0; idx < module.Count(); idx++) {
@@ -3764,7 +3874,7 @@ bool SetDescription(wxArrayString& module, const wxString& description, bool sym
             if (keyword.CmpNoCase(wxT("$MODULE")) == 0) {
                 module.Insert(wxT("Cd ") + description, idx + 1);
                 return true;
-            } else if (keyword.Cmp(wxT("(module")) == 0) {
+            } else if (keyword.Cmp(wxT("(module")) == 0 || keyword.Cmp(wxT("(footprint")) == 0) {
                 module.Insert(wxT("(descr \"") + description + wxT("\")"), idx + 1);
                 return true;
             }
@@ -3776,6 +3886,11 @@ bool SetDescription(wxArrayString& module, const wxString& description, bool sym
 /* For symbols and footprints */
 wxString GetKeywords(const wxArrayString& module, bool symbolmode)
 {
+    if (symbolmode) {
+        wxString value;
+        if (GetModernSymbolProperty(module, wxT("ki_keywords"), &value))
+            return value;
+    }
     /* although it is possible to detect whether the "module" contains a footprint
        or a symbol, it is probably best not to try */
     for (unsigned idx = 0; idx < module.Count(); idx++) {
@@ -3796,6 +3911,12 @@ wxString GetKeywords(const wxArrayString& module, bool symbolmode)
 /* For symbols and footprints */
 bool SetKeywords(wxArrayString& module, const wxString& keywords, bool symbolmode)
 {
+    if (symbolmode) {
+        wxString text = KiCadLinesToText(module);
+        std::vector<KiCadSexprNode> nodes;
+        if (ParseKiCadSexpr(text, &nodes) && FindKiCadSexprRoot(nodes, wxT("symbol")) >= 0)
+            return SetModernSymbolProperty(&module, wxT("ki_keywords"), keywords);
+    }
     for (unsigned idx = 0; idx < module.Count(); idx++) {
         wxString line = module[idx];
         wxString keyword = GetToken(&line);
@@ -3822,7 +3943,8 @@ bool SetKeywords(wxArrayString& module, const wxString& keywords, bool symbolmod
         if (!symbolmode && keyword.CmpNoCase(wxT("$MODULE")) == 0) {
             module.Insert(wxT("Kw ") + keywords, idx + 1);
             return true;
-        } else if (!symbolmode && keyword.Cmp(wxT("(module")) == 0) {
+        } else if (!symbolmode && (keyword.Cmp(wxT("(module")) == 0
+                                    || keyword.Cmp(wxT("(footprint")) == 0)) {
             module.Insert(wxT("(tags \"") + keywords + wxT("\")"), idx + 1);
             return true;
         } else if (symbolmode && keyword.CmpNoCase(wxT("$ENDCMP")) == 0) {
@@ -3836,6 +3958,9 @@ bool SetKeywords(wxArrayString& module, const wxString& keywords, bool symbolmod
 /* For symbols */
 wxString GetPrefix(const wxArrayString& symbol)
 {
+    wxString value;
+    if (GetModernSymbolProperty(symbol, wxT("Reference"), &value))
+        return value;
     for (unsigned idx = 0; idx < symbol.Count(); idx++) {
         wxString line = symbol[idx];
         wxString keyword = GetToken(&line);
@@ -3851,6 +3976,30 @@ wxString GetPrefix(const wxArrayString& symbol)
 /* For symbols, determine the number of "units" in a symbol (a quad opamp has four opamp units) */
 int GetUnitCount(const wxArrayString& symbol)
 {
+    wxString text = KiCadLinesToText(symbol);
+    std::vector<KiCadSexprNode> modernNodes;
+    int modernRoot = -1;
+    if (ParseKiCadSexpr(text, &modernNodes)
+        && (modernRoot = FindKiCadSexprRoot(modernNodes, wxT("symbol"))) >= 0)
+    {
+        int maxunit = 1;
+        wxString rootname = modernNodes[modernRoot].atoms.empty()
+            ? wxEmptyString : modernNodes[modernRoot].atoms[0].value;
+        for (size_t idx = 0; idx < modernNodes.size(); idx++) {
+            if (modernNodes[idx].parent == modernRoot && modernNodes[idx].head == wxT("symbol")
+                && !modernNodes[idx].atoms.empty())
+            {
+                wxString unitname = modernNodes[idx].atoms[0].value;
+                if (unitname.StartsWith(rootname + wxT("_"))) {
+                    long unit = 0;
+                    unitname.Mid(rootname.length() + 1).BeforeFirst(wxT('_')).ToLong(&unit);
+                    if (unit > maxunit)
+                        maxunit = (int)unit;
+                }
+            }
+        }
+        return maxunit;
+    }
     int max = 0;
     for (unsigned idx = 0; idx < symbol.Count(); idx++) {
         wxString line = symbol[idx];
@@ -3912,6 +4061,9 @@ bool SetAliases(wxArrayString& module, const wxString& aliases)
 /* For symbols */
 wxString GetFootprints(const wxArrayString& module)
 {
+    wxString value;
+    if (GetModernSymbolProperty(module, wxT("ki_fp_filters"), &value))
+        return value;
     for (unsigned idx = 0; idx < module.Count(); idx++) {
         wxString line = module[idx];
         if (line.CmpNoCase(wxT("$FPLIST")) == 0) {
@@ -3933,6 +4085,10 @@ wxString GetFootprints(const wxArrayString& module)
 /* For symbols */
 bool SetFootprints(wxArrayString& module, const wxString& footprints)
 {
+    wxString text = KiCadLinesToText(module);
+    std::vector<KiCadSexprNode> nodes;
+    if (ParseKiCadSexpr(text, &nodes) && FindKiCadSexprRoot(nodes, wxT("symbol")) >= 0)
+        return SetModernSymbolProperty(&module, wxT("ki_fp_filters"), footprints);
     unsigned pos = 0;
     /* find the section, erase it completely */
     for (unsigned idx = 0; idx < module.Count(); idx++) {
@@ -5442,6 +5598,265 @@ bool StoreSymbolInfo(const wxString& name, const wxString& description,
     #endif
 }
 
+static bool IsSymbolDirectory(const wxString& filename)
+{
+    return wxFileName::DirExists(filename)
+        && wxFileName(filename).GetExt().CmpNoCase(wxT("kicad_symdir")) == 0;
+}
+
+static bool IsModernSymbolLibrary(const wxString& filename)
+{
+    return IsSymbolDirectory(filename)
+        || wxFileName(filename).GetExt().CmpNoCase(wxT("kicad_sym")) == 0;
+}
+
+static wxString CompactKiCadSexpr(const wxArrayString& lines)
+{
+    wxString input = KiCadLinesToText(lines);
+    wxString compact;
+    bool inString = false;
+    bool escaped = false;
+    bool pendingSpace = false;
+    for (size_t idx = 0; idx < input.length(); idx++) {
+        wxChar ch = input[idx];
+        if (!inString && ch == wxT(';')) {
+            while (idx < input.length() && input[idx] != wxT('\n'))
+                idx++;
+            pendingSpace = true;
+            continue;
+        }
+        if (!inString && (ch == wxT(' ') || ch == wxT('\t')
+                          || ch == wxT('\r') || ch == wxT('\n')))
+        {
+            pendingSpace = true;
+            continue;
+        }
+        if (pendingSpace && !compact.IsEmpty() && compact.Last() != wxT('(')
+            && ch != wxT('(') && ch != wxT(')'))
+        {
+            compact += wxT(' ');
+        }
+        pendingSpace = false;
+        compact += ch;
+        if (inString && escaped) {
+            escaped = false;
+        } else if (inString && ch == wxT('\\')) {
+            escaped = true;
+        } else if (ch == wxT('"')) {
+            inString = !inString;
+        }
+    }
+    return compact;
+}
+
+bool IsModernSymbolLibraryPath(const wxString& filename)
+{
+    return IsModernSymbolLibrary(filename);
+}
+
+static wxString ModernSymbolFile(const wxString& library, const wxString& name)
+{
+    if (!IsSymbolDirectory(library))
+        return library;
+    wxFileName file = wxFileName::DirName(library);
+    file.SetFullName(name + wxT(".kicad_sym"));
+    return file.GetFullPath();
+}
+
+static int FindModernSymbolNode(const wxString& text, const wxString& name,
+                                std::vector<KiCadSexprNode>* nodes, int* root)
+{
+    if (!ParseKiCadSexpr(text, nodes))
+        return -1;
+    *root = FindKiCadSexprRoot(*nodes, wxT("kicad_symbol_lib"));
+    if (*root < 0)
+        return -1;
+    for (size_t idx = 0; idx < nodes->size(); idx++) {
+        const KiCadSexprNode& node = (*nodes)[idx];
+        if (node.parent == *root && node.head == wxT("symbol") && !node.atoms.empty()
+            && node.atoms[0].value.CmpNoCase(name) == 0)
+        {
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+static bool LoadModernSymbolText(const wxString& library, const wxString& name,
+                                 wxString* text, std::vector<KiCadSexprNode>* nodes,
+                                 int* symbolNode)
+{
+    if (!ReadKiCadTextFile(ModernSymbolFile(library, name), text))
+        return false;
+    int root = -1;
+    *symbolNode = FindModernSymbolNode(*text, name, nodes, &root);
+    return *symbolNode >= 0;
+}
+
+static wxString ModernSymbolParentFromText(const wxString& text, const wxString& name)
+{
+    std::vector<KiCadSexprNode> nodes;
+    int root = -1;
+    int symbol = FindModernSymbolNode(text, name, &nodes, &root);
+    if (symbol < 0)
+        return wxEmptyString;
+    for (size_t idx = 0; idx < nodes.size(); idx++) {
+        if (nodes[idx].parent == symbol && nodes[idx].head == wxT("extends")
+            && !nodes[idx].atoms.empty())
+        {
+            return nodes[idx].atoms[0].value;
+        }
+    }
+    return wxEmptyString;
+}
+
+static wxString ModernSymbolParent(const wxString& library, const wxString& name)
+{
+    wxString text;
+    if (!ReadKiCadTextFile(ModernSymbolFile(library, name), &text))
+        return wxEmptyString;
+    return ModernSymbolParentFromText(text, name);
+}
+
+static wxString IndentSexprBlock(const wxString& block, const wxString& newline)
+{
+    wxString indented = block;
+    indented.Replace(wxT("\r\n"), wxT("\n"));
+    indented.Replace(wxT("\r"), wxT("\n"));
+    indented.Replace(wxT("\n"), newline + wxT("  "));
+    return wxT("  ") + indented;
+}
+
+static bool RenameModernSymbolBlock(wxString* block, const wxString& oldname,
+                                    const wxString& newname)
+{
+    std::vector<KiCadSexprNode> nodes;
+    if (!ParseKiCadSexpr(*block, &nodes))
+        return false;
+    int symbol = FindKiCadSexprRoot(nodes, wxT("symbol"));
+    if (symbol < 0 || nodes[symbol].atoms.empty()
+        || nodes[symbol].atoms[0].value.CmpNoCase(oldname) != 0)
+    {
+        return false;
+    }
+
+    std::vector<KiCadReplacement> replacements;
+    KiCadReplacement replacement;
+    replacement.start = nodes[symbol].atoms[0].start;
+    replacement.end = nodes[symbol].atoms[0].end;
+    replacement.value = ReplacementAtom(nodes[symbol].atoms[0], newname);
+    replacements.push_back(replacement);
+
+    for (size_t idx = 0; idx < nodes.size(); idx++) {
+        const KiCadSexprNode& node = nodes[idx];
+        if (node.parent == symbol && node.head == wxT("property") && node.atoms.size() >= 2
+            && node.atoms[0].value == wxT("Value")
+            && node.atoms[1].value.CmpNoCase(oldname) == 0)
+        {
+            replacement.start = node.atoms[1].start;
+            replacement.end = node.atoms[1].end;
+            replacement.value = ReplacementAtom(node.atoms[1], newname);
+            replacements.push_back(replacement);
+        }
+
+        /* Embedded symbol unit IDs conventionally start with <library-id>_. */
+        if (node.head == wxT("symbol") && !node.atoms.empty() && (int)idx != symbol) {
+            int parent = node.parent;
+            bool descendant = false;
+            while (parent >= 0) {
+                if (parent == symbol) {
+                    descendant = true;
+                    break;
+                }
+                parent = nodes[parent].parent;
+            }
+            wxString prefix = oldname + wxT("_");
+            if (descendant && node.atoms[0].value.StartsWith(prefix)) {
+                wxString unitname = newname + node.atoms[0].value.Mid(oldname.length());
+                replacement.start = node.atoms[0].start;
+                replacement.end = node.atoms[0].end;
+                replacement.value = ReplacementAtom(node.atoms[0], unitname);
+                replacements.push_back(replacement);
+            }
+        }
+    }
+    ApplyReplacements(block, &replacements);
+    return true;
+}
+
+static bool UpdateModernExtends(wxString* text, const wxString& oldname,
+                                const wxString& newname, int skipSymbol = -1)
+{
+    std::vector<KiCadSexprNode> nodes;
+    if (!ParseKiCadSexpr(*text, &nodes))
+        return false;
+    int root = FindKiCadSexprRoot(nodes, wxT("kicad_symbol_lib"));
+    if (root < 0)
+        return false;
+    std::vector<KiCadReplacement> replacements;
+    for (size_t idx = 0; idx < nodes.size(); idx++) {
+        const KiCadSexprNode& node = nodes[idx];
+        if (node.head != wxT("extends") || node.atoms.empty()
+            || node.atoms[0].value.CmpNoCase(oldname) != 0)
+        {
+            continue;
+        }
+        int parent = node.parent;
+        if (parent < 0 || nodes[parent].parent != root || nodes[parent].head != wxT("symbol")
+            || parent == skipSymbol)
+        {
+            continue;
+        }
+        KiCadReplacement replacement;
+        replacement.start = node.atoms[0].start;
+        replacement.end = node.atoms[0].end;
+        replacement.value = ReplacementAtom(node.atoms[0], newname);
+        replacements.push_back(replacement);
+    }
+    ApplyReplacements(text, &replacements);
+    return true;
+}
+
+bool GetSymbolNames(const wxString& filename, wxArrayString* names)
+{
+    wxASSERT(names != NULL);
+    names->Clear();
+    if (!IsModernSymbolLibrary(filename))
+        return false;
+
+    wxArrayString files;
+    if (IsSymbolDirectory(filename)) {
+        wxDir dir(filename);
+        wxString entry;
+        bool more = dir.GetFirst(&entry, wxT("*.kicad_sym"), wxDIR_FILES);
+        while (more) {
+            files.Add(wxFileName(filename, entry).GetFullPath());
+            more = dir.GetNext(&entry);
+        }
+    } else {
+        files.Add(filename);
+    }
+
+    for (size_t fileIndex = 0; fileIndex < files.Count(); fileIndex++) {
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        if (!ReadKiCadTextFile(files[fileIndex], &text) || !ParseKiCadSexpr(text, &nodes))
+            return false;
+        int root = FindKiCadSexprRoot(nodes, wxT("kicad_symbol_lib"));
+        if (root < 0)
+            return false;
+        for (size_t idx = 0; idx < nodes.size(); idx++) {
+            if (nodes[idx].parent == root && nodes[idx].head == wxT("symbol")
+                && !nodes[idx].atoms.empty())
+            {
+                names->Add(nodes[idx].atoms[0].value);
+            }
+        }
+    }
+    names->Sort();
+    return true;
+}
+
 static unsigned FindSymbolStart(const wxString& filename, const wxString& name)
 {
     if (!wxFileExists(filename))
@@ -5542,10 +5957,84 @@ bool ExistSymbol(const wxString& filename, const wxString& name, const wxString&
             wxString msg = curlGet(name, author, wxT("symbols"), 0);
             return msg.length() == 0;
         #endif
+    } else if (IsModernSymbolLibrary(filename)) {
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        int symbol = -1;
+        return LoadModernSymbolText(filename, name, &text, &nodes, &symbol);
     } else {
         unsigned start = FindSymbolStart(filename, name);
         return start > 0;
     }
+}
+
+static bool CopySymbolDependenciesRecursive(const wxString& source, const wxString& target,
+                                            const wxString& name, wxArrayString* visiting)
+{
+    if (!IsModernSymbolLibrary(source) || !IsModernSymbolLibrary(target)
+        || source.CmpNoCase(target) == 0)
+    {
+        return true;
+    }
+    if (visiting->Index(name, false) != wxNOT_FOUND)
+        return false; /* invalid cyclic inheritance */
+    visiting->Add(name);
+
+    wxString parent = ModernSymbolParent(source, name);
+    if (parent.IsEmpty()) {
+        visiting->Remove(name);
+        return true;
+    }
+    if (!ExistSymbol(source, parent)) {
+        visiting->Remove(name);
+        return false;
+    }
+    if (!CopySymbolDependenciesRecursive(source, target, parent, visiting)) {
+        visiting->Remove(name);
+        return false;
+    }
+    wxArrayString parentData;
+    if (!LoadSymbol(source, parent, wxEmptyString, false, &parentData)) {
+        visiting->Remove(name);
+        return false;
+    }
+    if (ExistSymbol(target, parent)) {
+        wxArrayString targetParent;
+        if (!LoadSymbol(target, parent, wxEmptyString, false, &targetParent)
+            || CompactKiCadSexpr(targetParent) != CompactKiCadSexpr(parentData))
+        {
+            visiting->Remove(name);
+            return false;
+        }
+    } else if (!InsertSymbol(target, parent, parentData)) {
+        visiting->Remove(name);
+        return false;
+    }
+    visiting->Remove(name);
+    return true;
+}
+
+bool CopySymbolDependencies(const wxString& source, const wxString& target, const wxString& name)
+{
+    wxArrayString visiting;
+    return CopySymbolDependenciesRecursive(source, target, name, &visiting);
+}
+
+bool SymbolHasDependents(const wxString& filename, const wxString& name)
+{
+    if (!IsModernSymbolLibrary(filename))
+        return false;
+    wxArrayString symbols;
+    if (!GetSymbolNames(filename, &symbols))
+        return false;
+    for (size_t idx = 0; idx < symbols.Count(); idx++) {
+        if (symbols[idx].CmpNoCase(name) != 0
+            && ModernSymbolParent(filename, symbols[idx]).CmpNoCase(name) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool InsertSymbol(const wxString& filename, const wxString& name, const wxArrayString& symbol)
@@ -5557,7 +6046,79 @@ bool InsertSymbol(const wxString& filename, const wxString& name, const wxArrayS
             wxString msg = curlPut(name, wxT("symbols"), symbol);
             return msg.length() == 0;
         #endif
+    } else if (IsModernSymbolLibrary(filename)) {
+        if (ExistSymbol(filename, name))
+            return false;
+
+        wxString block = KiCadLinesToText(symbol);
+        std::vector<KiCadSexprNode> blockNodes;
+        if (!ParseKiCadSexpr(block, &blockNodes))
+            return false;
+        int blockRoot = FindKiCadSexprRoot(blockNodes, wxT("symbol"));
+        if (blockRoot < 0) {
+            int libraryRoot = FindKiCadSexprRoot(blockNodes, wxT("kicad_symbol_lib"));
+            for (size_t idx = 0; libraryRoot >= 0 && idx < blockNodes.size(); idx++) {
+                if (blockNodes[idx].parent == libraryRoot && blockNodes[idx].head == wxT("symbol")
+                    && !blockNodes[idx].atoms.empty()
+                    && blockNodes[idx].atoms[0].value.CmpNoCase(name) == 0)
+                {
+                    blockRoot = (int)idx;
+                    block = block.Mid(blockNodes[idx].start,
+                                      blockNodes[idx].end - blockNodes[idx].start);
+                    break;
+                }
+            }
+        }
+        if (blockRoot < 0)
+            return false;
+
+        if (IsSymbolDirectory(filename)) {
+            wxString newline = wxT("\n");
+            wxString contents = wxT("(kicad_symbol_lib") + newline
+                + wxT("  (version 20251024)") + newline
+                + wxT("  (generator kicad_librarian)") + newline
+                + wxT("  (generator_version \"1.5\")") + newline
+                + IndentSexprBlock(block, newline) + newline + wxT(")") + newline;
+            wxString symbolFile = ModernSymbolFile(filename, name);
+            if (!WriteKiCadTextFile(symbolFile, contents))
+                return false;
+
+            wxString written;
+            std::vector<KiCadSexprNode> writtenNodes;
+            int writtenSymbol = -1;
+            if (!LoadModernSymbolText(filename, name, &written, &writtenNodes, &writtenSymbol)) {
+                wxRemoveFile(symbolFile);
+                return false;
+            }
+            return true;
+        }
+
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        if (!ReadKiCadTextFile(filename, &text) || !ParseKiCadSexpr(text, &nodes))
+            return false;
+        int root = FindKiCadSexprRoot(nodes, wxT("kicad_symbol_lib"));
+        if (root < 0 || nodes[root].end == 0)
+            return false;
+        wxString newline = text.Find(wxT("\r\n")) >= 0 ? wxT("\r\n") : wxT("\n");
+        size_t insertionPoint = nodes[root].end - 1;
+        wxString insertion;
+        if (insertionPoint > 0 && text[insertionPoint - 1] != wxT('\n')
+            && text[insertionPoint - 1] != wxT('\r'))
+        {
+            insertion += newline;
+        }
+        insertion += IndentSexprBlock(block, newline) + newline;
+        ReplaceKiCadRange(&text, insertionPoint, insertionPoint, insertion);
+        return WriteKiCadTextFile(filename, text);
     } else {
+        wxString possibleModern = KiCadLinesToText(symbol);
+        std::vector<KiCadSexprNode> possibleNodes;
+        if (ParseKiCadSexpr(possibleModern, &possibleNodes)
+            && FindKiCadSexprRoot(possibleNodes, wxT("symbol")) >= 0)
+        {
+            return false; /* do not corrupt a legacy library with S-expressions */
+        }
         wxTextFile file;
         if (!file.Open(filename))
             return false;
@@ -5677,6 +6238,34 @@ bool InsertSymbol(const wxString& filename, const wxString& name, const wxArrayS
     }
 }
 
+bool SaveSymbol(const wxString& filename, const wxString& name, const wxArrayString& symbol)
+{
+    if (!IsModernSymbolLibrary(filename)) {
+        if (!RemoveSymbol(filename, name))
+            return false;
+        return InsertSymbol(filename, name, symbol);
+    }
+
+    wxString replacement = KiCadLinesToText(symbol);
+    std::vector<KiCadSexprNode> replacementNodes;
+    int replacementRoot = -1;
+    if (!ParseKiCadSexpr(replacement, &replacementNodes)
+        || (replacementRoot = FindKiCadSexprRoot(replacementNodes, wxT("symbol"))) < 0
+        || replacementNodes[replacementRoot].atoms.empty()
+        || replacementNodes[replacementRoot].atoms[0].value.CmpNoCase(name) != 0)
+    {
+        return false;
+    }
+
+    wxString text;
+    std::vector<KiCadSexprNode> nodes;
+    int existing = -1;
+    if (!LoadModernSymbolText(filename, name, &text, &nodes, &existing))
+        return false;
+    ReplaceKiCadRange(&text, nodes[existing].start, nodes[existing].end, replacement);
+    return WriteKiCadTextFile(ModernSymbolFile(filename, name), text);
+}
+
 bool RemoveSymbol(const wxString& filename, const wxString& name)
 {
     if (filename.CmpNoCase(LIB_REPOS) == 0) {
@@ -5686,6 +6275,32 @@ bool RemoveSymbol(const wxString& filename, const wxString& name)
             wxString msg = curlDelete(name, wxT("symbols"));
             return msg.length() == 0;
         #endif
+    } else if (IsModernSymbolLibrary(filename)) {
+        if (SymbolHasDependents(filename, name))
+            return false; /* deleting a parent would corrupt its children */
+
+        if (IsSymbolDirectory(filename))
+            return wxRemoveFile(ModernSymbolFile(filename, name));
+
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        int symbol = -1;
+        if (!LoadModernSymbolText(filename, name, &text, &nodes, &symbol))
+            return false;
+        size_t start = nodes[symbol].start;
+        size_t end = nodes[symbol].end;
+        size_t lineStart = text.rfind(wxT('\n'), start);
+        lineStart = (lineStart == wxString::npos) ? 0 : lineStart + 1;
+        if (text.Mid(lineStart, start - lineStart).Trim().IsEmpty())
+            start = lineStart;
+        while (end < text.length() && (text[end] == wxT(' ') || text[end] == wxT('\t')))
+            end++;
+        if (end < text.length() && text[end] == wxT('\r'))
+            end++;
+        if (end < text.length() && text[end] == wxT('\n'))
+            end++;
+        ReplaceKiCadRange(&text, start, end, wxEmptyString);
+        return WriteKiCadTextFile(filename, text);
     } else {
         unsigned start = FindSymbolStart(filename, name);
         if (start == 0)
@@ -5726,6 +6341,16 @@ bool RemoveSymbol(const wxString& filename, const wxString& name)
 
 bool RenameSymbol(wxArrayString* symbol, const wxString& oldname, const wxString& newname)
 {
+    wxString modern = KiCadLinesToText(*symbol);
+    std::vector<KiCadSexprNode> nodes;
+    if (ParseKiCadSexpr(modern, &nodes)
+        && FindKiCadSexprRoot(nodes, wxT("symbol")) >= 0)
+    {
+        if (!RenameModernSymbolBlock(&modern, oldname, newname))
+            return false;
+        KiCadTextToLines(modern, symbol);
+        return true;
+    }
     for (int idx = 0; idx < (int)symbol->Count(); idx++) {
         wxString line = (*symbol)[idx];
         if (line[0] == wxT('#') && line.Find(oldname) > 0) {
@@ -5756,6 +6381,61 @@ bool RenameSymbol(const wxString& filename, const wxString& oldname, const wxStr
             msg = curlDelete(oldname, wxT("symbols"));
             return msg.length() == 0;
         #endif
+    } else if (IsModernSymbolLibrary(filename)) {
+        if (ExistSymbol(filename, newname))
+            return false;
+
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        int symbol = -1;
+        if (!LoadModernSymbolText(filename, oldname, &text, &nodes, &symbol))
+            return false;
+        wxString block = text.Mid(nodes[symbol].start,
+                                  nodes[symbol].end - nodes[symbol].start);
+        if (!RenameModernSymbolBlock(&block, oldname, newname))
+            return false;
+        ReplaceKiCadRange(&text, nodes[symbol].start, nodes[symbol].end, block);
+
+        if (IsSymbolDirectory(filename)) {
+            wxString newfile = ModernSymbolFile(filename, newname);
+            wxString oldfile = ModernSymbolFile(filename, oldname);
+            if (!WriteKiCadTextFile(newfile, text))
+                return false;
+            wxString written;
+            std::vector<KiCadSexprNode> writtenNodes;
+            int writtenSymbol = -1;
+            if (!LoadModernSymbolText(filename, newname, &written,
+                                      &writtenNodes, &writtenSymbol))
+            {
+                wxRemoveFile(newfile);
+                return false;
+            }
+            if (!wxRemoveFile(oldfile)) {
+                wxRemoveFile(newfile);
+                return false;
+            }
+
+            wxDir dir(filename);
+            wxString entry;
+            bool more = dir.GetFirst(&entry, wxT("*.kicad_sym"), wxDIR_FILES);
+            while (more) {
+                wxString childfile = wxFileName(filename, entry).GetFullPath();
+                wxString childtext;
+                if (!ReadKiCadTextFile(childfile, &childtext))
+                    return false;
+                wxString updated = childtext;
+                if (!UpdateModernExtends(&updated, oldname, newname))
+                    return false;
+                if (updated != childtext && !WriteKiCadTextFile(childfile, updated))
+                    return false;
+                more = dir.GetNext(&entry);
+            }
+            return true;
+        }
+
+        if (!UpdateModernExtends(&text, oldname, newname))
+            return false;
+        return WriteKiCadTextFile(filename, text);
     } else {
         unsigned start = FindSymbolStart(filename, oldname);
         if (start == 0)
@@ -5832,6 +6512,16 @@ bool LoadSymbol(const wxString& filename, const wxString& name, const wxString& 
             wxString msg = curlGet(name, author, wxT("symbols"), symbol);
             return msg.length() == 0;
         #endif
+    } else if (IsModernSymbolLibrary(filename)) {
+        wxString text;
+        std::vector<KiCadSexprNode> nodes;
+        int symbolNode = -1;
+        if (!LoadModernSymbolText(filename, name, &text, &nodes, &symbolNode))
+            return false;
+        wxString block = text.Mid(nodes[symbolNode].start,
+                                  nodes[symbolNode].end - nodes[symbolNode].start);
+        KiCadTextToLines(block, symbol);
+        return symbol->Count() > 0;
     } else {
         unsigned start = FindSymbolStart(filename, name);
         if (start == 0)

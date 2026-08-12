@@ -27,6 +27,7 @@
 #include "libmngr_paths.h"
 #include "libmngr_dlgreport.h"
 #include "libmngr_dlgtemplate.h"
+#include "kicadsymbolpreview.h"
 #include "pdfreport.h"
 #include "remotelink.h"
 #include "rpn.h"
@@ -236,6 +237,7 @@ AppFrame(parent)
 
     PinData[0] = PinData[1] = NULL;
     PinDataCount[0] = PinDataCount[1] = 0;
+    UseSymbolPreviewData[0] = UseSymbolPreviewData[1] = false;
     SelectedPartLeft = SelectedPartRight = -1;
     PartEdited = FieldEdited = false;
 
@@ -2431,6 +2433,8 @@ void libmngrFrame::DrawSymbols(wxGraphicsContext *gc, int midx, int midy, const 
             continue;
         if (PartData[fp].Count() == 0)
             continue;
+        const wxArrayString& symbolData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
         /* Draw the outline, plus optionally the texts */
         if (fp == 0) {
             clrForeground.Set(128, 16, 16, transp[fp]);
@@ -2448,8 +2452,8 @@ void libmngrFrame::DrawSymbols(wxGraphicsContext *gc, int midx, int midy, const 
             bool indraw = false;
             double pinname_offset = size_pinshape;
             bool show_pinnr = true, show_pinname = true;
-            for (int idx = 0; idx < (int)PartData[fp].Count(); idx++) {
-                wxString line = PartData[fp][idx];
+            for (int idx = 0; idx < (int)symbolData.Count(); idx++) {
+                wxString line = symbolData[idx];
                 wxASSERT(line.Length() > 0);
                 if (line[0] == wxT('#'))
                     continue;
@@ -4944,6 +4948,8 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
 {
     m_statusBar->SetStatusText(wxEmptyString);
     PartData[fp].Clear();
+    SymbolPreviewData[fp].Clear();
+    UseSymbolPreviewData[fp] = false;
 
     /* get the name of the symbol and the library it is in */
     wxString symbol = list->GetItemText(index);
@@ -5009,6 +5015,13 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
                 wxMessageBox(wxT("Failed to open library ") + filename);
             else
                 wxMessageBox(wxT("Symbol ") + symbol + wxT(" is not present."));
+        } else if (IsModernSymbolLibraryPath(filename)) {
+            wxString previewError;
+            if (LoadModernSymbolPreview(filename, symbol, &SymbolPreviewData[fp], &previewError)) {
+                UseSymbolPreviewData[fp] = true;
+            } else {
+                m_statusBar->SetStatusText(wxT("Preview unavailable: ") + previewError);
+            }
         }
     } else {
         if (!LoadFootprint(filename, symbol, author, DontRebuildTemplate, &PartData[fp], &version)) {
@@ -5035,13 +5048,15 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
         PinData[fp] = 0;
         PinDataCount[fp] = 0;
     }
+    const wxArrayString& displayData = SymbolMode && UseSymbolPreviewData[fp]
+        ? SymbolPreviewData[fp] : PartData[fp];
     if (SymbolMode) {
         /* extract pin names and order */
-        GetPinNames(PartData[fp], NULL, &PinDataCount[fp]);
+        GetPinNames(displayData, NULL, &PinDataCount[fp]);
         if (PinDataCount[fp] > 0) {
             PinData[fp] = new PinInfo[PinDataCount[fp]];
             wxASSERT(PinData[fp] != NULL);
-            GetPinNames(PartData[fp], PinData[fp], NULL);
+            GetPinNames(displayData, PinData[fp], NULL);
         }
     } else {
         /* get the pin pitch and pad size, plus the body size */
@@ -5050,8 +5065,8 @@ void libmngrFrame::LoadPart(int index, wxListCtrl* list, wxChoice* choice, int f
         /* optionally cache the metadata (pitch, courtyard, descriptions) */
         CacheMetadata(filename, symbol, false, PartData[fp], Footprint[fp]);
     }
-    GetBodySize(PartData[fp], &BodySize[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
-    GetTextLabelSize(PartData[fp], &LabelData[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
+    GetBodySize(displayData, &BodySize[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
+    GetTextLabelSize(displayData, &LabelData[fp], SymbolMode, Footprint[fp].Type >= VER_MM);
     if (SymbolMode) {
         /* re-assign the pins to custom sections (now that the body size is known) */
         wxString templatename = GetTemplateName(PartData[fp]);
@@ -6960,7 +6975,9 @@ void libmngrFrame::UpdateDetails(int fp)
         }
         SetTextField(m_txtPadCount, wxString::Format(wxT("%d"), PinDataCount[fp]), enable ? ENABLED : PROTECTED);
 
-        int unitcount = GetUnitCount(PartData[fp]);
+        const wxArrayString& displayData = UseSymbolPreviewData[fp]
+            ? SymbolPreviewData[fp] : PartData[fp];
+        int unitcount = GetUnitCount(displayData);
         enable = unitcount > 1 && DefEnable;
         m_spinUnitSelect->SetRange(1, unitcount);
         m_spinUnitSelect->SetValue(SymbolUnitNumber[fp]);

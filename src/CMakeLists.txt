@@ -61,6 +61,7 @@ SET(LIBMAN_SRCS librarymanager.cpp          librarymanager.h
                 libmngr_gui_base.cpp        libmngr_gui_base.h
                 cxffont.cpp                 cxffont.h
                 kicadsexpr.cpp              kicadsexpr.h
+                kicadsymbolpreview.cpp       kicadsymbolpreview.h
                 libraryfunctions.cpp        libraryfunctions.h
                 pdfreport.cpp               pdfreport.h
                 rpn.cpp                     rpn.h
@@ -100,7 +101,8 @@ INCLUDE(CTest)
 IF(BUILD_TESTING)
     ADD_EXECUTABLE(kicadsexpr_tests
                    ../tests/kicadsexpr_tests.cpp
-                   kicadsexpr.cpp)
+                   kicadsexpr.cpp
+                   kicadsymbolpreview.cpp)
     TARGET_INCLUDE_DIRECTORIES(kicadsexpr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     TARGET_LINK_LIBRARIES(kicadsexpr_tests ${wxWidgets_LIBRARIES})
     ADD_TEST(NAME kicadsexpr_tests COMMAND kicadsexpr_tests)
